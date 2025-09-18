@@ -1,0 +1,8 @@
+timestamp,model,http_status,time_ms,ok,excerpt
+2025-09-14T16:43:33+05:30,deepseek/deepseek-v3.1-free,000,1348,no,""
+2025-09-14T16:43:35+05:30,deepseek/r1-free,000,436,no,""
+2025-09-14T16:43:35+05:30,deepseek/qwen3-8b-free,000,403,no,""
+2025-09-14T16:43:36+05:30,nous/deephermes-3-llama-3-8b,000,679,no,""
+2025-09-14T16:43:37+05:30,openai/gpt-oss-20b,000,1006,no,""
+2025-09-14T16:43:38+05:30,openai/gpt-oss-120b,000,1439,no,""
+2025-09-14T16:43:39+05:30,google/gemini-2.0-flash-exp,000,1128,no,""

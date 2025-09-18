@@ -1,0 +1,17 @@
+.venv/
+__pycache__/
+*.pyc
+*.bak
+*.log
+db.sqlite3
+.env
+.venv/
+__pycache__/
+*.pyc
+*.bak
+*.log
+db.sqlite3
+.env
+llama.cpp/
+node_modules/
+testfile

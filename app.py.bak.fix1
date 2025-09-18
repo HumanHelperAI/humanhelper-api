@@ -1,0 +1,644 @@
+# app.py
+"""
+Main API for HumanHelper backend (cleaned & resilient).
+- Admin endpoints under /admin/*
+- Uses writer.enqueue_write(...) for queued writes
+- Read queries use run_query(...)
+- deposit()/withdraw() routes accept either (ok,msg) or (ok,msg,wait_log,eta)
+
+Combined API server for HumanHelperAI
+- Includes: admin routes, user routes, queued writer, periodic cleanup
+- Optional AI integrations: OpenAI (old SDK style), Google Gemini, DeepSeek (HTTP)
+Paste this file directly into your project (nano app.py).
+Make sure other modules exist: database.py, writer.py, wallet.py, earnings.py
+"""
+from flask import Flask, request, jsonify, Blueprint
+from flask_cors import CORS
+from functools import wraps
+import threading
+import time
+import os
+import requests
+import json
+import random
+from typing import Tuple
+from database import init_db, run_query, cleanup_old_logs
+from writer import start_writer, enqueue_write
+from wallet import deposit, withdraw
+from earnings import reward_user
+from dotenv import load_dotenv
+load_dotenv()   # <-- this loads your .env file into os.environ
+
+# Local modules (these must exist and match the expected function signatures)
+# - database.py: init_db(), run_query(query, params=(), fetch=False), cleanup_old_logs()
+# - writer.py: start_writer(), enqueue_write(query, params=(), timeout=10.0) -> (ok, rows, wait_log, eta, err)
+# - wallet.py: deposit(mobile, amount) -> (ok,msg) or (ok,msg,wait_log,eta)
+# - earnings.py: reward_user(mobile, video_id, content_type, duration) -> (ok, result_or_message)
+
+
+
+# -------------------- Optional AI integrations --------------------
+# OpenAI (legacy SDK 0.28.0 usage) - optional
+OPENAI_OK = False
+try:
+    import openai  # recommended pinned: openai==0.28.0 if you use this style
+    OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
+    if OPENAI_API_KEY:
+        openai.api_key = OPENAI_API_KEY
+        OPENAI_OK = True
+except Exception:
+    openai = None
+    OPENAI_OK = False
+
+# Google Gemini (optional)
+GEMINI_OK = False
+try:
+    import google.generativeai as genai
+    GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
+    if GEMINI_API_KEY:
+        genai.configure(api_key=GEMINI_API_KEY)
+        GEMINI_OK = True
+except Exception:
+    genai = None
+    GEMINI_OK = False
+
+# DeepSeek (example HTTP-based service) - optional
+DEEPSEEK_OK = False
+try:
+    import requests
+    DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY", "")
+    DEEPSEEK_OK = bool(DEEPSEEK_API_KEY)
+except Exception:
+    requests = None
+    DEEPSEEK_API_KEY = ""
+    DEEPSEEK_OK = False
+
+# Helper wrappers for AI calls (all return (ok, answer_or_error_string))
+# --- Replace ask_openai with this (uses requests, no openai package required) ---
+
+
+def _do_request_with_retries(method, url, headers=None, json_body=None, timeout=15, max_attempts=4):
+    """
+    Helper: do requests with exponential backoff + jitter and respect Retry-After header.
+    Returns: (ok: bool, response_obj_or_error_str)
+    """
+    attempt = 0
+    backoff_base = 0.6
+    while attempt < max_attempts:
+        try:
+            if method.lower() == "post":
+                resp = requests.post(url, headers=headers, json=json_body, timeout=timeout)
+            else:
+                resp = requests.get(url, headers=headers, params=json_body, timeout=timeout)
+            # If 2xx -> return
+            if 200 <= resp.status_code < 300:
+                return True, resp
+            # If server suggests Retry-After, honor it
+            if resp.status_code in (429, 503) and 'Retry-After' in resp.headers:
+                try:
+                    ra = int(resp.headers.get('Retry-After', '0'))
+                except Exception:
+                    ra = 0
+                # small jitter
+                wait = ra + random.uniform(0.2, 0.6)
+                time.sleep(wait)
+                attempt += 1
+                continue
+            # For 4xx like 402, 401, 403 — they are not transient; return error obj
+            return False, resp
+        except requests.exceptions.RequestException as e:
+            # network error -> backoff and retry
+            sleep_for = backoff_base * (2 ** attempt) + random.uniform(0, 0.4)
+            time.sleep(sleep_for)
+            attempt += 1
+            last_exc = e
+    return False, f"Request failed after {max_attempts} attempts: {last_exc}"
+
+import time
+import json
+
+def ask_openai(prompt: str, system: str | None = None, timeout: int = 15, max_retries: int = 3):
+    """
+    Call OpenAI Chat Completions via REST using requests (no openai package required).
+    Returns: (ok: bool, answer_or_error: str)
+    Retries on 429 and transient network errors; logs a short audit record on fatal failure.
+    """
+    OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "") or ""
+    if not OPENAI_API_KEY:
+        return False, "OpenAI not configured on server"
+
+    url = "https://api.openai.com/v1/chat/completions"
+    headers = {
+        "Authorization": f"Bearer {OPENAI_API_KEY}",
+        "Content-Type": "application/json",
+    }
+    body = {
+        "model": os.getenv("OPENAI_MODEL", "gpt-3.5-turbo"),
+        "temperature": float(os.getenv("OPENAI_TEMPERATURE", "0.3")),
+        "max_tokens": int(os.getenv("OPENAI_MAX_TOKENS", "400")),
+        "messages": []
+    }
+    if system:
+        body["messages"].append({"role": "system", "content": system})
+    body["messages"].append({"role": "user", "content": prompt})
+
+    backoff = 1.0
+    last_err = None
+    for attempt in range(1, max_retries + 1):
+        try:
+            r = requests.post(url, headers=headers, json=body, timeout=timeout)
+            # handle explicit 429 (rate limit / quota)
+            if r.status_code == 429:
+                last_err = f"429 {r.text}"
+                if attempt < max_retries:
+                    time.sleep(backoff)
+                    backoff *= 2
+                    continue
+                # final failure
+                err_msg = f"OpenAI rate-limited/quota exhausted (429). Response: {r.text}"
+                # audit best-effort
+                try:
+                    enqueue_write("INSERT INTO audit_log (action, actor, target, details, ip) VALUES (?,?,?,?,?)",
+                                  ("ai_call_failed", "server", "openai", err_msg[:800], "-"), timeout=2.0)
+                except Exception:
+                    pass
+                return False, err_msg
+
+            r.raise_for_status()
+            j = r.json()
+            if "choices" in j and len(j["choices"]) > 0:
+                msg = j["choices"][0].get("message", {}).get("content")
+                if msg is None:
+                    msg = j["choices"][0].get("text", "")
+                return True, (msg or "").strip()
+            # Unexpected shape: return JSON snippet
+            return True, str(j)[:2000]
+
+        except requests.exceptions.RequestException as e:
+            last_err = str(e)
+            if attempt < max_retries:
+                time.sleep(backoff)
+                backoff *= 2
+                continue
+            # final network failure -> audit and return error
+            err_msg = f"OpenAI request error after {attempt} attempts: {e}"
+            try:
+                enqueue_write("INSERT INTO audit_log (action, actor, target, details, ip) VALUES (?,?,?,?,?)",
+                              ("ai_call_failed", "server", "openai", err_msg[:800], "-"), timeout=2.0)
+            except Exception:
+                pass
+            return False, err_msg
+        except Exception as e:
+            last_err = str(e)
+            err_msg = f"OpenAI parse/error: {e}"
+            try:
+                enqueue_write("INSERT INTO audit_log (action, actor, target, details, ip) VALUES (?,?,?,?,?)",
+                              ("ai_call_failed", "server", "openai", err_msg[:800], "-"), timeout=2.0)
+            except Exception:
+                pass
+            return False, err_msg
+
+def deepseek_chat(prompt: str, timeout: int = 15) -> Tuple[bool, str]:
+    DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY", "") or ""
+    if not DEEPSEEK_API_KEY:
+        return False, "DeepSeek not configured on server"
+    url = os.getenv("DEEPSEEK_URL", "https://api.deepseek.com/v1/chat/completions")
+    headers = {"Authorization": f"Bearer {DEEPSEEK_API_KEY}", "Content-Type": "application/json"}
+    payload = {
+        "model": os.getenv("DEEPSEEK_MODEL", "deepseek-chat"),
+        "messages": [{"role": "user", "content": prompt}],
+        "temperature": float(os.getenv("DEEPSEEK_TEMPERATURE", "0.6")),
+        "max_tokens": int(os.getenv("DEEPSEEK_MAX_TOKENS", "400"))
+    }
+
+    ok, resp = _do_request_with_retries("post", url, headers=headers, json_body=payload, timeout=timeout)
+    if not ok:
+        if isinstance(resp, requests.Response):
+            try:
+                body_txt = resp.text[:1000]
+            except Exception:
+                body_txt = str(resp.status_code)
+            return False, f"DeepSeek error: {resp.status_code} {body_txt}"
+        return False, str(resp)
+    try:
+        j = resp.json()
+        if "choices" in j and len(j["choices"]) > 0:
+            return True, j["choices"][0].get("message", {}).get("content", "").strip()
+        return True, j.get("text", str(j))
+    except Exception as e:
+        return False, f"DeepSeek parse error: {e}"
+
+def ask_gemini(prompt: str, timeout: int = 15):
+    if not GEMINI_OK or not genai:
+        return False, "Gemini not available on server"
+    try:
+        model = genai.GenerativeModel("gemini-pro")
+        resp = model.generate_content(prompt)
+        return True, (resp.text or "").strip()
+    except Exception as e:
+        return False, f"Gemini error: {e}"
+
+# ---------------- Admin blueprint ----------------
+admin_bp = Blueprint("admin", __name__, url_prefix="/admin")
+
+# ADMIN_TOKEN — set via environment or .env in your setup
+ADMIN_TOKEN = os.getenv("ADMIN_TOKEN", "changeme")
+
+def admin_required(fn):
+    @wraps(fn)
+    def wrapper(*args, **kwargs):
+        token = request.headers.get("X-Admin-Token", "")
+        if not token or token != ADMIN_TOKEN:
+            return jsonify({"error": "admin auth failed"}), 403
+        return fn(*args, **kwargs)
+    return wrapper
+
+def _audit(action, actor, target, details):
+    """Write an audit log entry (queued to writer). Best-effort."""
+    ip = request.headers.get("X-Forwarded-For") or request.remote_addr or "-"
+    try:
+        enqueue_write(
+            "INSERT INTO audit_log (action, actor, target, details, ip) VALUES (?,?,?,?,?)",
+            (action, actor, target, details, ip),
+            timeout=3.0
+        )
+    except Exception:
+        pass  # ignore audit errors
+
+# --- Admin endpoints ---
+@admin_bp.get("/users")
+@admin_required
+def list_users():
+    q = (request.args.get("q") or "").strip()
+    limit = int(request.args.get("limit", 50))
+    offset = int(request.args.get("offset", 0))
+    params, sql = [], "SELECT id,name,mobile,aadhar,pan,balance,is_banned FROM users"
+    if q:
+        sql += " WHERE name LIKE ? OR mobile LIKE ? OR pan LIKE ?"
+        like = f"%{q}%"
+        params.extend([like, like, like])
+    sql += " ORDER BY id DESC LIMIT ? OFFSET ?"
+    params.extend([limit, offset])
+    rows = run_query(sql, tuple(params), fetch=True)
+    users = [{"id": r[0], "name": r[1], "mobile": r[2], "aadhar": r[3],
+              "pan": r[4], "balance": r[5], "is_banned": bool(r[6])} for r in rows]
+    return jsonify({"users": users})
+
+@admin_bp.post("/user/ban")
+@admin_required
+def user_ban():
+    data = request.json or {}
+    mobile, reason = data.get("mobile"), data.get("reason", "")
+    if not mobile:
+        return jsonify({"error": "mobile required"}), 400
+    ok, _, log, eta, err = enqueue_write("UPDATE users SET is_banned=1 WHERE mobile=?", (mobile,), timeout=10.0)
+    _audit("user_ban", "admin", mobile, reason)
+    if not ok:
+        return jsonify({"error": err or "ban failed", "wait_log": log, "eta": eta}), 400
+    return jsonify({"message": f"user {mobile} banned ✅", "wait_log": log, "eta": eta}), 200
+
+@admin_bp.post("/user/unban")
+@admin_required
+def user_unban():
+    data = request.json or {}
+    mobile = data.get("mobile")
+    if not mobile:
+        return jsonify({"error": "mobile required"}), 400
+    ok, _, log, eta, err = enqueue_write("UPDATE users SET is_banned=0 WHERE mobile=?", (mobile,), timeout=10.0)
+    _audit("user_unban", "admin", mobile, "")
+    if not ok:
+        return jsonify({"error": err or "unban failed", "wait_log": log, "eta": eta}), 400
+    return jsonify({"message": f"user {mobile} unbanned ✅", "wait_log": log, "eta": eta}), 200
+
+@admin_bp.post("/user/delete")
+@admin_required
+def user_delete():
+    data = request.json or {}
+    mobile, pan = data.get("mobile"), data.get("pan")
+    if not (mobile or pan):
+        return jsonify({"error": "mobile or pan required"}), 400
+    field, val = ("mobile", mobile) if mobile else ("pan", pan)
+    ok, _, log, eta, err = enqueue_write(f"DELETE FROM users WHERE {field}=?", (val,), timeout=10.0)
+    _audit("user_delete", "admin", val, "")
+    if not ok:
+        return jsonify({"error": err or "delete failed", "wait_log": log, "eta": eta}), 400
+    return jsonify({"message": f"user {val} deleted ✅", "wait_log": log, "eta": eta}), 200
+
+@admin_bp.post("/balance/adjust")
+@admin_required
+def balance_adjust():
+    data = request.json or {}
+    mobile = data.get("mobile")
+    try:
+        delta = float(data.get("delta", 0))
+    except Exception:
+        return jsonify({"error": "invalid delta"}), 400
+    note = data.get("note", "")
+    if not mobile or delta == 0:
+        return jsonify({"error": "mobile and non-zero delta required"}), 400
+
+    ok1, _, l1, e1, err1 = enqueue_write("UPDATE users SET balance=balance+? WHERE mobile=?", (delta, mobile), timeout=10.0)
+    ok2, _, l2, e2, err2 = enqueue_write(
+        "INSERT INTO transactions (mobile,type,amount,status,admin_note) VALUES (?,?,?,?,?)",
+        (mobile, "admin_adjust", abs(delta), "completed", note),
+        timeout=10.0
+    )
+    _audit("balance_adjust", "admin", mobile, f"delta={delta}; note={note}")
+    if ok1 and ok2:
+        return jsonify({"message": f"balance adjusted by ₹{delta} ✅", "wait_log": l1 + l2, "eta": max(e1, e2)}), 200
+    return jsonify({"error": err1 or err2 or "adjust failed", "wait_log": l1 + l2, "eta": max(e1, e2)}), 400
+
+@admin_bp.get("/transactions")
+@admin_required
+def tx_list():
+    mobile = request.args.get("mobile")
+    status = request.args.get("status")
+    limit = int(request.args.get("limit", 50))
+    offset = int(request.args.get("offset", 0))
+    sql = "SELECT id,mobile,type,amount,status,admin_note,timestamp FROM transactions"
+    params = []
+    clauses = []
+    if mobile:
+        clauses.append("mobile=?"); params.append(mobile)
+    if status:
+        clauses.append("status=?"); params.append(status)
+    if clauses:
+        sql += " WHERE " + " AND ".join(clauses)
+    sql += " ORDER BY id DESC LIMIT ? OFFSET ?"; params.extend([limit, offset])
+    rows = run_query(sql, tuple(params), fetch=True)
+    data = [{"id": r[0], "mobile": r[1], "type": r[2], "amount": r[3], "status": r[4], "admin_note": r[5], "timestamp": r[6]} for r in rows]
+    return jsonify({"transactions": data})
+
+@admin_bp.post("/transaction/add")
+@admin_required
+def tx_add():
+    d = request.json or {}
+    m, t, a, n = d.get("mobile"), d.get("type"), d.get("amount"), d.get("note", "")
+    try:
+        a = float(a)
+    except Exception:
+        return jsonify({"error": "invalid amount"}), 400
+    if not (m and t and a):
+        return jsonify({"error": "mobile,type,amount required"}), 400
+    ok, _, log, eta, err = enqueue_write("INSERT INTO transactions (mobile,type,amount,status,admin_note) VALUES (?,?,?,?,?)",
+                                         (m, t, a, "completed", n), timeout=10.0)
+    _audit("transaction_add", "admin", m, f"{t} {a}")
+    if not ok:
+        return jsonify({"error": err or "add failed", "wait_log": log, "eta": eta}), 400
+    return jsonify({"message": "transaction added ✅", "wait_log": log, "eta": eta}), 201
+
+@admin_bp.get("/audit")
+@admin_required
+def audit_list():
+    limit = int(request.args.get("limit", 50))
+    offset = int(request.args.get("offset", 0))
+    rows = run_query("SELECT id,action,actor,target,details,ip,timestamp FROM audit_log ORDER BY id DESC LIMIT ? OFFSET ?", (limit, offset), fetch=True)
+    data = [{"id": r[0], "action": r[1], "actor": r[2], "target": r[3], "details": r[4], "ip": r[5], "timestamp": r[6]} for r in rows]
+    return jsonify({"audit": data})
+
+# ----------------- App boot -----------------
+app = Flask(__name__)
+CORS(app)
+init_db()
+start_writer()
+app.register_blueprint(admin_bp)
+
+# Register blueprints (guarded to avoid "setup method can't be called" errors
+# when Flask's reloader imports modules multiple times during development).
+# Ensure these blueprint objects (admin_bp, github_bp, gemini_bp) are imported above.
+
+if "admin" not in app.blueprints:
+    app.register_blueprint(admin_bp)
+
+# If your github blueprint variable was exported as `gh_bp` or similar,
+# make sure app imports it as `github_bp` (or adjust the name here).
+if "github" not in app.blueprints:
+    try:
+        app.register_blueprint(github_bp)
+    except NameError:
+        # defensive fallback for dev editing: log and continue
+        print("Warning: github_bp not defined at time of registration; skipping.")
+
+if "gemini_proxy" not in app.blueprints and "gemini" not in app.blueprints:
+    # Some people name their gemini blueprint 'gemini' or 'gemini_proxy' — guard both
+    try:
+        app.register_blueprint(gemini_bp)
+    except NameError:
+        print("Warning: gemini_bp not defined at time of registration; skipping.")
+
+try:
+    from gemini_proxy import gemini_bp
+    app.register_blueprint(gemini_bp)
+except Exception as e:
+    # don't break startup if proxy file is missing or contains errors
+    print("gemini_proxy not registered:", e)
+
+# register gemini proxy
+# optionally set from env into app.config so the blueprint uses the latest values:
+app.config["GEMINI_REST_URL"] = os.getenv("GEMINI_REST_URL", "")
+app.config["GEMINI_API_KEY"] = os.getenv("GEMINI_API_KEY", "")
+app.config["GEMINI_PROXY_KEY"] = os.getenv("GEMINI_PROXY_KEY", "")
+app.config["GEMINI_AUTH_METHOD"] = os.getenv("GEMINI_AUTH_METHOD", "bearer")
+# ------------------periodic cleanup-----------------------------
+
+def _cleanup_loop():
+    while True:
+        try:
+            cleanup_old_logs()
+        except Exception as e:
+            print("Cleanup error:", e)
+        time.sleep(6 * 60 * 60)
+
+threading.Thread(target=_cleanup_loop, daemon=True).start()
+
+# ----------------- Helper: normalize wallet returns -----------------
+def _normalize_wallet_result(res):
+    """
+    Wallet functions may return:
+      - (ok, msg)
+      - (ok, msg, wait_log, eta)
+    Normalize to (ok, msg, wait_log, eta)
+    """
+    if not isinstance(res, (list, tuple)):
+        return False, "invalid response", [], 0
+    if len(res) == 2:
+        ok, msg = res
+        return ok, msg, [], 0
+    if len(res) >= 4:
+        ok, msg, wait_log, eta = res[0], res[1], res[2], res[3]
+        return ok, msg, wait_log or [], eta or 0
+    return False, "invalid response shape", [], 0
+
+# ----------------- User routes -----------------
+@app.route("/signup", methods=["POST"])
+def signup():
+    data = request.json or {}
+    # basic validation
+    if not data.get("name") or not data.get("mobile") or not data.get("aadhar") or not data.get("password"):
+        return jsonify({"error": "name, mobile, aadhar and password required"}), 400
+    try:
+        ok, _, wait_log, eta, err = enqueue_write(
+            "INSERT INTO users (name, mobile, aadhar, pan, password) VALUES (?,?,?,?,?)",
+            (data.get("name"), data.get("mobile"), data.get("aadhar"), data.get("pan", ""), data.get("password")),
+            timeout=10.0
+        )
+        if not ok:
+            return jsonify({"error": err or "Signup failed", "wait_log": wait_log, "eta_seconds": eta}), 400
+        return jsonify({"message": "User registered ✅", "wait_log": wait_log, "eta_seconds": eta}), 201
+    except Exception as e:
+        return jsonify({"error": str(e)}), 400
+
+@app.route("/login", methods=["POST"])
+def login():
+    d = request.json or {}
+    rows = run_query("SELECT balance,is_banned FROM users WHERE mobile=? AND password=?", (d.get("mobile"), d.get("password")), fetch=True)
+    if rows:
+        if rows[0][1]:
+            return jsonify({"error": "Account banned ❌"}), 403
+        return jsonify({"message": "Login successful ✅", "balance": rows[0][0]})
+    return jsonify({"error": "Invalid credentials ❌"}), 401
+
+@app.route("/balance/<mobile>", methods=["GET"])
+def balance(mobile):
+    r = run_query("SELECT balance FROM users WHERE mobile=?", (mobile,), fetch=True)
+    return jsonify({"mobile": mobile, "balance": r[0][0] if r else 0.0})
+
+@app.route("/deposit", methods=["POST"])
+def deposit_route():
+    d = request.json or {}
+    try:
+        res = deposit(d["mobile"], float(d["amount"]))
+        ok, msg, wait_log, eta = _normalize_wallet_result(res)
+        return jsonify({"mobile": d["mobile"], "message": msg, "wait_log": wait_log, "eta_seconds": eta}), (200 if ok else 400)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 400
+
+@app.route("/withdraw", methods=["POST"])
+def withdraw_route():
+    d = request.json or {}
+    try:
+        res = withdraw(d["mobile"], float(d["amount"]))
+        ok, msg, wait_log, eta = _normalize_wallet_result(res)
+        return jsonify({"mobile": d["mobile"], "message": msg, "wait_log": wait_log, "eta_seconds": eta}), (200 if ok else 400)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 400
+
+@app.route("/transactions/<mobile>", methods=["GET"])
+def transactions(mobile):
+    txns = run_query("SELECT id,type,amount,status,admin_note,timestamp FROM transactions WHERE mobile=? ORDER BY timestamp DESC", (mobile,), fetch=True)
+    return jsonify({"mobile": mobile, "transactions": [{"id": i, "type": t, "amount": a, "status": s, "admin_note": n, "timestamp": ts} for i, t, a, s, n, ts in txns]})
+
+@app.route("/earn", methods=["POST"])
+def earn():
+    d = request.json or {}
+    ok, res = reward_user(d.get("mobile"), d.get("video_id"), d.get("content_type"), int(d.get("duration", 0)))
+    if not ok:
+        return jsonify({"message": res}), 400
+    new_bal = run_query("SELECT balance FROM users WHERE mobile=?", (d.get("mobile"),), fetch=True)[0][0]
+    return jsonify({"mobile": d.get("mobile"), "message": f"Earned ₹{res['earned']} ✅ (₹{res['charity']} → charity)", "new_balance": new_bal})
+
+@app.route("/charity/balance", methods=["GET"])
+def charity_balance():
+    r = run_query("SELECT balance FROM charity_wallet WHERE id=1", fetch=True)
+    return jsonify({"charity_balance": r[0][0] if r else 0.0})
+
+# ----------------- Single AI endpoint that chooses provider -----------------
+
+@app.route("/ai/ask", methods=["POST"])
+def ai_ask():
+    """
+    Body:
+      { "provider": "openai"|"gemini"|"deepseek", "prompt": "...", "system": "... (optional)" }
+    Returns:
+      { "provider": provider, "ok": bool, "answer": str_or_error }
+    Fallback strategy when provider == "openai":
+      1) try OpenAI
+      2) if OpenAI fails, try DeepSeek
+      3) if DeepSeek fails, try local Gemini proxy (127.0.0.1:5000/ai/gemini-proxy) if GEMINI_PROXY_KEY present
+    """
+    data = request.json or {}
+    provider = (data.get("provider") or "openai").lower()
+    prompt = data.get("prompt", "").strip()
+    system = data.get("system")
+
+    if not prompt:
+        return jsonify({"error": "prompt required"}), 400
+
+    # Explicit provider modes:
+    if provider == "openai":
+        ok, ans = ask_openai(prompt, system=system)
+        # if OpenAI succeeded — return immediately
+        if ok:
+            return jsonify({"provider": "openai", "ok": ok, "answer": ans})
+        # OpenAI failed: try DeepSeek next
+        ok2, ans2 = deepseek_chat(prompt)
+        if ok2:
+            return jsonify({"provider": "deepseek", "ok": ok2, "answer": ans2})
+        # DeepSeek failed: try Gemini proxy (local forwarding) if configured
+        proxy_key = os.getenv("GEMINI_PROXY_KEY", "") or ""
+        if proxy_key:
+            try:
+                prox = requests.post(
+                    "http://127.0.0.1:5000/ai/gemini-proxy",
+                    headers={
+                        "X-GEMINI-PROXY-KEY": proxy_key,
+                        "Content-Type": "application/json"
+                    },
+                    json={"prompt": prompt, "system": system},
+                    timeout=20
+                )
+            except Exception as e:
+                # network to proxy failed; continue to final fallback
+                prox = None
+                prox_err = f"Proxy request failed: {e}"
+
+            if prox is not None:
+                # If proxy returned success, forward its JSON body if possible
+                try:
+                    body = prox.json()
+                except Exception:
+                    body = prox.text
+                # If the proxy returned a successful response code, forward as successful
+                if 200 <= prox.status_code < 300:
+                    return jsonify({"provider": "gemini", "ok": True, "answer": body}), prox.status_code
+                # Proxy returned non-2xx — forward the error body with the proxy status code
+                return jsonify({"provider": "gemini", "ok": False, "answer": body}), prox.status_code
+        # Nothing worked — return original OpenAI failure message as last-resort
+        return jsonify({"provider": "openai", "ok": ok, "answer": ans})
+
+    elif provider == "gemini":
+        ok, ans = ask_gemini(prompt)  # SDK path; app may also have gemini proxy separately
+        return jsonify({"provider": "gemini", "ok": ok, "answer": ans})
+
+    elif provider in ("deepseek", "deep_seek", "deep-seek"):
+        ok, ans = deepseek_chat(prompt)
+        return jsonify({"provider": "deepseek", "ok": ok, "answer": ans})
+
+    else:
+        return jsonify({"error": "unknown provider"}), 400
+
+@app.route("/ai/status", methods=["GET"])
+def ai_status():
+    return jsonify({
+        "openai_configured": bool(os.getenv("OPENAI_API_KEY")),
+        "gemini_configured": bool(os.getenv("GEMINI_API_KEY")),
+        "deepseek_configured": bool(os.getenv("DEEPSEEK_API_KEY")),
+        "notes": {
+            "openai": "Configured if OPENAI_API_KEY present; may still be out of quota.",
+            "gemini": "Gemini SDK may not be installable in Termux; see README for options.",
+            "deepseek": "Configured if DEEPSEEK_API_KEY present; may still be out of balance."
+        }
+    })
+
+# ----------------- Health & admin helpers -----------------
+@app.route("/health", methods=["GET"])
+def health_route():
+    try:
+        run_query("SELECT 1", fetch=True)
+        return jsonify({"status": "ok"})
+    except Exception as e:
+        return jsonify({"status": "error", "detail": str(e)}), 500
+
+# ----------------- Run -----------------
+if __name__ == "__main__":
+    app.run(debug=True, host="0.0.0.0", port=int(os.getenv("PORT", 5000)), threaded=False, use_reloader=False)
