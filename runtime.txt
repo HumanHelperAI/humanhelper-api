@@ -1,0 +1,5 @@
+cd ~/projects/humanhelper-api
+echo "python-3.11.9" > runtime.txt
+git add runtime.txt
+git commit -m "Add runtime.txt for Railway"
+git push
