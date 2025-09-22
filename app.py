@@ -449,8 +449,7 @@ app = Flask(__name__)
 
 # For testing, allow all origins. When ready for production replace "*" with your frontend origin:
 # e.g. CORS(app, resources={r"/*": {"origins": ["https://humanhelperai.github.io"]}})
-CORS(app, resources={r"/*": {"origins": "*"}})
-
+CORS(app, resources={r"/*": {"origins": ["https://humanhelperai.github.io"]}})
 # Add consistent headers (keep minimal — let flask_cors add the Access-Control-Allow-Origin header)
 @app.after_request
 def add_cors_headers(response):
