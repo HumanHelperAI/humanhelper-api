@@ -436,7 +436,7 @@ def audit_list():
 
 # ------------------------ App init ------------------------
 app = Flask(__name__)
-CORS(app)
+CORS(app, resources={r"/*": {"origins": "*"}})
 init_db()
 start_writer()
 app.register_blueprint(admin_bp)
