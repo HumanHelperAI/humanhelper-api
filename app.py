@@ -435,20 +435,63 @@ def audit_list():
     return jsonify({"audit": data})
 
 # ------------------------ App init ------------------------
-app = Flask(__name__)
-CORS(app, resources={r"/*": {"origins": "*"}})
-init_db()
-start_writer()
-app.register_blueprint(admin_bp)
+#!/usr/bin/env python3
+# app.py - merged + root route + clean CORS handling
 
-# periodic cleanup thread for logs (non-blocking)
+from flask import Flask, jsonify, request
+from flask_cors import CORS
+import threading
+import time
+import os
+
+# ----------------- Create app and enable CORS immediately -----------------
+app = Flask(__name__)
+
+# For testing, allow all origins. When ready for production replace "*" with your frontend origin:
+# e.g. CORS(app, resources={r"/*": {"origins": ["https://humanhelperai.github.io"]}})
+CORS(app, resources={r"/*": {"origins": "*"}})
+
+# Add consistent headers (keep minimal — let flask_cors add the Access-Control-Allow-Origin header)
+@app.after_request
+def add_cors_headers(response):
+    # Avoid duplicating or misspelling header names. Only add extra helpful headers.
+    response.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS, PUT, DELETE"
+    response.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization, X-Requested-With"
+    response.headers["Access-Control-Max-Age"] = "86400"
+    return response
+
+# ------------------------ App init (your code) ------------------------
+# NOTE: These are expected to be defined elsewhere in your project:
+# init_db(), start_writer(), admin_bp, cleanup_old_logs(), run_query()
+# If they're missing you will see warning messages (we keep these safe so app still runs).
+
+try:
+    init_db()
+except NameError:
+    print("Warning: init_db() not defined in this module (expected elsewhere).")
+
+try:
+    start_writer()
+except NameError:
+    print("Warning: start_writer() not defined in this module (expected elsewhere).")
+
+try:
+    app.register_blueprint(admin_bp)
+except NameError:
+    print("Warning: admin_bp not defined in this module (expected elsewhere).")
+
+# ----------------- periodic cleanup thread for logs (non-blocking) -----------------
 def _cleanup_loop():
     while True:
         try:
             cleanup_old_logs()
+        except NameError:
+            # If it's not defined, don't crash; warn and sleep
+            print("cleanup_old_logs() not defined; skipping cleanup.")
         except Exception as e:
             print("Cleanup error:", e)
         time.sleep(6 * 60 * 60)
+
 threading.Thread(target=_cleanup_loop, daemon=True).start()
 
 # ------------------------ Wallet helpers normalization ------------------------
@@ -463,14 +506,34 @@ def _normalize_wallet_result(res):
         return ok, msg, wait_log or [], eta or 0
     return False, "invalid response shape", [], 0
 
-# ------------------------ User endpoints (signup/login/wallet/etc) ------------------------
+# ------------------------ Health endpoints ------------------------
 @app.route("/health", methods=["GET"])
 def health():
+    # lightweight DB check when run_query available; otherwise still return OK
     try:
         run_query("SELECT 1", fetch=True)
-    except Exception:
+    except NameError:
+        # run_query not present — skip DB check (assume OK)
         pass
-    return jsonify({"status": "ok"})
+    except Exception as e:
+        # Log DB check exception but still return ok for health probe (adjust if you want to fail)
+        print("health check DB exception:", e)
+    return jsonify({"message": "Human Helper API is live", "status": "ok"})
+
+# Add root route (so frontend requests to "/" succeed)
+@app.route("/", methods=["GET"])
+def root():
+    # Return same as /health so frontend that calls "/" gets a JSON success
+    return jsonify({"message": "Human Helper API is live", "status": "ok"})
+
+# ----------------- Add more endpoints below as needed -----------------
+
+# ----------------- Run server (main) -----------------
+if __name__ == "__main__":
+    # Railway (and many PaaS) set PORT environment variable
+    port = int(os.environ.get("PORT", 5000))
+    # Bind to 0.0.0.0 for external access on PaaS; debug False in production
+    app.run(host="0.0.0.0", port=port, debug=False)
 
 @app.route("/signup", methods=["POST"])
 def signup():
