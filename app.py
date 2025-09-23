@@ -884,7 +884,6 @@ if __name__ == "__main__":
     # start Flask
     app.run(debug=True, host="0.0.0.0", port=port, threaded=False, use_reloader=False)
 
-=======
 from flask import Flask, jsonify, request
 app = Flask(__name__)
 
@@ -899,4 +898,4 @@ def echo():
     return jsonify({"you_sent": data})
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5000
+    app.run(host="0.0.0.0", port=5000)
