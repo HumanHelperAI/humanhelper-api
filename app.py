@@ -148,7 +148,6 @@ def ask_openai_rest(prompt: str, timeout: int = OPENAI_TIMEOUT) -> Tuple[bool, s
         "temperature": float(os.getenv("OPENAI_TEMPERATURE","0.3"))
     }
     ok, resp = _do_request_with_retries("post", url, headers=headers, json_body=body, timeout=timeout)
-    if not ok:
         if isinstance(resp, requests.Response):
             return False, f"OpenAI error {resp.status_code}: {resp.text[:800]}"
         return False, str(resp)
@@ -484,18 +483,18 @@ def add_cors_headers(response):
 # optional external functions — don't crash if missing:
 try:
     init_db()
-except NameError:
-    print("Warning: init_db() not defined here.")
+except Exception as e:
+    print("init_db failed (nonfatal):", e)
 
 try:
     start_writer()
-except NameError:
-    print("Warning: start_writer() not defined here.")
+except Exception as e:
+    print("start_writer failed (nonfatal):", e)
 
 try:
     app.register_blueprint(admin_bp)
-except NameError:
-    print("Warning: admin_bp not defined here.")
+except Exception as e:
+    print("admin_bp failed (nonfatal):", e)
 
 if __name__ == "__main__":
     # local dev run
@@ -595,7 +594,6 @@ def user_transactions(mobile):
     try:
         rows = run_query("SELECT id,type,amount,status,admin_note,timestamp FROM transactions WHERE mobile=? ORDER BY id DESC LIMIT 200", (mobile,), fetch=True)
         txs = [{"id": r[0], "type": r[1], "amount": r[2], "status": r[3], "admin_note": r[4], "timestamp": r[5]} for r in rows]
-        return jsonify({"mobile": mobile, "transactions": txs})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
@@ -867,6 +865,12 @@ def github_gist():
         return jsonify({"error": res}), 400
     return jsonify({"ok": True, "url": res})
 
+# example endpoint
+@app.route("/echo", methods=["POST"])
+def echo():
+    data = request.json or {}
+    return jsonify({"you_sent": data})
+
 # ------------------------ Run app ------------------------
 if __name__ == "__main__":
     port = int(os.getenv("PORT", 5000))
@@ -877,18 +881,4 @@ if __name__ == "__main__":
     # start Flask
     app.run(debug=True, host="0.0.0.0", port=port, threaded=False, use_reloader=False)
 
-from flask import Flask, jsonify, request
-app = Flask(__name__)
 
-@app.route("/")
-def home():
-    return jsonify({"status":"ok","message":"Human Helper API is live"})
-
-# example endpoint
-@app.route("/echo", methods=["POST"])
-def echo():
-    data = request.json or {}
-    return jsonify({"you_sent": data})
-
-if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5000)
