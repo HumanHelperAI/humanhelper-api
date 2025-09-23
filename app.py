@@ -439,73 +439,66 @@ def audit_list():
 # app.py - minimal health + CORS example for Railway / local dev
 import time
 import threading
+from flask import Flask, jsonify
+from flask_cors import CORS
 
 app = Flask(__name__)
 
-# IMPORTANT: allow only your GitHub Pages origin (no wildcard)
-# Replace with your exact Github Pages origin if different.
-ALLOWED_ORIGINS = ["https://humanhelperai.github.io"]
+# ALLOWED origins - Github Pages + local dev addresses you might use
+ALLOWED_ORIGINS = [
+    "https://humanhelperai.github.io",
+    "http://127.0.0.1:5000",
+    "http://localhost:5000",
+    "http://127.0.0.1:5173",
+    "http://localhost:5173"
+]
 
 CORS(app, resources={r"/*": {"origins": ALLOWED_ORIGINS}})
 
-# (Optional) If you want to enable credentials later, set supports_credentials=True
-# CORS(app, resources={r"/*": {"origins": ALLOWED_ORIGINS}}, supports_credentials=True)
-
-# ------------------------ Simple endpoints ------------------------
 @app.route("/", methods=["GET"])
 def root():
-    # simple root for quick checks
     return jsonify({"message": "Human Helper API is live", "status": "ok"}), 200
 
 @app.route("/health", methods=["GET"])
 def health():
-    # lightweight health endpoint
+    # quick lightweight health
     return jsonify({"message": "Human Helper API is live", "status": "ok"}), 200
 
-# ------------------------ background cleanup (no-op safe example) ------------------------
 def _cleanup_loop():
     while True:
         try:
-            # if you have cleanup_old_logs() keep it; here we sleep harmlessly
             time.sleep(6 * 60 * 60)
         except Exception as e:
             print("Cleanup error:", e)
             time.sleep(60)
 
-# start background thread (daemon so it won't block shutdown)
 threading.Thread(target=_cleanup_loop, daemon=True).start()
 
 @app.after_request
 def add_cors_headers(response):
-    # Avoid duplicating or misspelling header names. Only add extra helpful headers.
     response.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS, PUT, DELETE"
     response.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization, X-Requested-With"
     response.headers["Access-Control-Max-Age"] = "86400"
     return response
 
-# NOTE: These are expected to be defined elsewhere in your project:
-# init_db(), start_writer(), admin_bp, cleanup_old_logs(), run_query()
-# If they're missing you will see warning messages (we keep these safe so app still runs).
-
+# optional external functions — don't crash if missing:
 try:
     init_db()
 except NameError:
-    print("Warning: init_db() not defined in this module (expected elsewhere).")
+    print("Warning: init_db() not defined here.")
 
 try:
     start_writer()
 except NameError:
-    print("Warning: start_writer() not defined in this module (expected elsewhere).")
+    print("Warning: start_writer() not defined here.")
 
 try:
     app.register_blueprint(admin_bp)
 except NameError:
-    print("Warning: admin_bp not defined in this module (expected elsewhere).")
+    print("Warning: admin_bp not defined here.")
 
-# ------------------------ Run (for local dev only) ------------------------
 if __name__ == "__main__":
-    # For local dev, run on 127.0.0.1:5000
-    # On Railway the gunicorn/Procfile will run the app normally.
+    # local dev run
     app.run(host="127.0.0.1", port=5000, debug=True)
 
 # ------------------------ Wallet helpers normalization ------------------------
