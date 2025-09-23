@@ -1,1 +1,1 @@
-web: gunicorn app:app -b 0.0.0.0:$PORT
+web: sh -lc 'gunicorn app:app -b 0.0.0.0:$PORT'
