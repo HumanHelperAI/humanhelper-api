@@ -60,3 +60,9 @@ cur.executescript(sql)
 conn.commit()
 conn.close()
 print("Tables created/ensured.")
+
+# create_tables.py
+from database import init_db
+if __name__ == "__main__":
+    init_db()
+    print("DB tables created / ensured.")

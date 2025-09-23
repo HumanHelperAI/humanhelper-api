@@ -1,0 +1,19 @@
+version: "3.8"
+services:
+  app:
+    build: .
+    container_name: humanhelper-backend
+    ports:
+      - "5000:5000"
+    volumes:
+      # persist sqlite DB (host ./dbdata will contain db.sqlite3)
+      - ./dbdata:/data
+      # mount code read-only so container sees the app (optional: remove :ro to allow edits)
+      - ./:/app:ro
+    environment:
+      # make sure database module resolves to the file we persist
+      - DATABASE_URL=/data/db.sqlite3
+      - DB_PATH=/data/db.sqlite3
+      - ADMIN_TOKEN=changeme
+      # add any additional envs you need, e.g. GEMINI_API_KEY, OPENAI_API_KEY
+    restart: unless-stopped
