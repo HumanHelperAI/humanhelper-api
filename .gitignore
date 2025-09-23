@@ -1,3 +1,4 @@
+<<<<<<< HEAD
 .venv/
 __pycache__/
 *.pyc
@@ -15,3 +16,9 @@ db.sqlite3
 llama.cpp/
 node_modules/
 testfile
+=======
+my key
+my key.pub
+id_ed25519
+id_ed25519.pub
+>>>>>>> origin/main
