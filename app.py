@@ -15,9 +15,6 @@ from flask_cors import CORS
 
 from flask_limiter import Limiter
 from flask_limiter.util import get_remote_address
-limiter = Limiter(get_remote_address, app=app, default_limits=["60 per minute"])
-# Example: tighter on /ai/ask later:
-# @limiter.limit("10/minute")
 
 # load .env if present
 try:
@@ -460,6 +457,16 @@ threading.Thread(target=_cleanup_loop, daemon=True).start()
 @app.route("/", methods=["GET"])
 def root():
     return jsonify({"message":"Human Helper API is live", "status":"ok"}), 200
+
+# Rate limit: 60 requests per minute per client IP (default)
+limiter = Limiter(
+    key_func=get_remote_address,
+    default_limits=["60/minute"],
+)
+limiter.init_app(app)
+
+# Optional: don’t rate-limit health checks
+@limiter.exempt
 
 @app.route("/health", methods=["GET"])
 def health():
