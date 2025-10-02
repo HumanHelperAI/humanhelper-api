@@ -13,6 +13,12 @@ import requests
 from flask import Flask, request, jsonify, Blueprint
 from flask_cors import CORS
 
+from flask_limiter import Limiter
+from flask_limiter.util import get_remote_address
+limiter = Limiter(get_remote_address, app=app, default_limits=["60 per minute"])
+# Example: tighter on /ai/ask later:
+# @limiter.limit("10/minute")
+
 # load .env if present
 try:
     from dotenv import load_dotenv
@@ -463,6 +469,11 @@ def health():
 @app.route("/echo", methods=["POST"])
 def echo():
     return jsonify({"you_sent": request.json or {}})
+
+@app.route("/version", methods=["GET"])
+def version():
+    sha = os.getenv("RAILWAY_GIT_COMMIT_SHA") or os.getenv("COMMIT_SHA", "dev")
+    return jsonify({"commit": sha}), 200
 
 @app.route("/debug/whichdb", methods=["GET"])
 def debug_whichdb():
