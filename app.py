@@ -459,6 +459,11 @@ def root():
 def health():
     return jsonify({"message":"Human Helper API is live", "status":"ok"}), 200
 
+# ✅ Simple echo test route
+@app.route("/echo", methods=["POST"])
+def echo():
+    return jsonify({"you_sent": request.json or {}})
+
 @app.route("/debug/whichdb", methods=["GET"])
 def debug_whichdb():
     import sqlite3
