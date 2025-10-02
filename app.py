@@ -408,26 +408,42 @@ def user_ban():
 # ----------------------
 app = Flask(__name__)
 
+# Allowed origins for browsers
 ALLOWED_ORIGINS = {
+    "http://127.0.0.1:5000",
+    "http://localhost:5000",
+    "http://127.0.0.1:5173",
+    "http://localhost:5173",
     "https://humanhelperai.in",
     "https://www.humanhelperai.in",
+    "https://api.humanhelperai.in",  # generally not needed, but ok
     "https://humanhelperai.github.io",
-    "http://localhost:5000",
-    "http://127.0.0.1:5000",
-    "http://localhost:5173",
-    "http://127.0.0.1:5173",
 }
 
-@app.after_request
-def add_cors_headers(resp):
-    origin = request.headers.get("Origin")
+def _cors_origin(origin: str) -> str | None:
+    if not origin:
+        return None
+    # exact match
     if origin in ALLOWED_ORIGINS:
-        resp.headers["Access-Control-Allow-Origin"] = origin
-        resp.headers["Vary"] = "Origin"
-        resp.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS, PUT, DELETE"
-        resp.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization, X-Requested-With, X-Admin-Token, X-Premium"
-        resp.headers["Access-Control-Max-Age"] = "86400"
-    return resp
+        return origin
+    return None
+
+@app.after_request
+def add_cors_headers(response):
+    origin = request.headers.get("Origin", "")
+    allow = _cors_origin(origin)
+    if allow:
+        response.headers["Access-Control-Allow-Origin"] = allow
+        response.headers["Vary"] = "Origin"
+    response.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS, PUT, DELETE"
+    response.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization, X-Requested-With, X-Admin-Token, X-Premium"
+    response.headers["Access-Control-Max-Age"] = "86400"
+    return response
+
+# Handle preflight quickly
+@app.route("/<path:anypath>", methods=["OPTIONS"])
+def options_any(anypath):
+    return ("", 204)
 
 # register admin blueprint
 try:
