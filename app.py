@@ -14,23 +14,59 @@ from flask import Flask, request, jsonify, Blueprint
 from flask_cors import CORS
 import re, json, logging
 from werkzeug.exceptions import HTTPException
+from passlib.hash import pbkdf2_sha256
 
-# ----------------------
-# Defensive local modules (stubs if missing)
-# ----------------------
+# --- SQLite helper for Termux/mobile ---
+import sqlite3
+DB_PATH = os.getenv("DATABASE_URL", "db.sqlite3")
+# normalize common forms like sqlite:///db.sqlite3
+if DB_PATH.startswith("sqlite:///"):
+    DB_PATH = DB_PATH[len("sqlite:///"):]
+if DB_PATH.startswith("file:"):
+    DB_PATH = DB_PATH[len("file:"):]
+
+def get_db():
+    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+    conn.row_factory = sqlite3.Row
+    return conn
+
 try:
     from database import init_db, run_query, cleanup_old_logs
 except Exception:
-    def init_db(*a, **k): 
-        print("[hh] database.init_db stub")
-    def run_query(sql, params=(), fetch=False):
-        # safe stub; return empty for fetch, else None
-        if fetch:
-            return []
-        return None
+    print("[hh] Warning: database module not found — using SQLite helpers")
+
+    def init_db():
+        # create users table if missing
+        db = get_db()
+        cur = db.cursor()
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS users (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              name TEXT,
+              mobile TEXT UNIQUE,
+              password_hash TEXT,
+              email TEXT,
+              address TEXT,
+              is_banned INTEGER DEFAULT 0,
+              balance REAL DEFAULT 0,
+              created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        db.commit()
+        db.close()
+
+    def run_query(sql: str, params: tuple = (), fetch: bool = False):
+        db = get_db()
+        cur = db.cursor()
+        cur.execute(sql, params)
+        rows = cur.fetchall() if fetch else None
+        db.commit()
+        db.close()
+        return rows
+
     def cleanup_old_logs():
-        return
-    print("[hh] Warning: database module not found — using stubs")
+        # nothing to do for SQLite demo
+        pass
 
 try:
     from writer import start_writer, enqueue_write
@@ -398,8 +434,16 @@ def user_ban():
 # ----------------------
 # Flask app init
 # ----------------------
+
 app = Flask(__name__)
 
+# --- Initialize SQLite DB on startup ---
+try:
+    init_db()
+    ensure_user_columns()
+    print("[hh] Database initialized ✅")
+except Exception as e:
+    print("[hh] Database init warning:", e)
 # Allowed origins for browsers
 ALLOWED_ORIGINS = {
     "http://127.0.0.1:5000",
@@ -684,31 +728,26 @@ def _send_code(destination: str, code: str):
     if SEND_VERIFICATION_MODE == "console":
         print(f"[VERIFY] send code {code} to {destination}")
     # Later: integrate SMS/email provider here.
-
 def ensure_user_columns():
-    """Add new columns to users if missing (SQLite-safe)"""
-    db = get_db()
-    cols = {r["name"] for r in db.execute("PRAGMA table_info(users)")}
-
-    def add(col_sql):
-        db.execute(f"ALTER TABLE users ADD COLUMN {col_sql}")
-
-    if "full_name" not in cols:
-        add("full_name TEXT")
-    if "email" not in cols:
-        add("email TEXT")
-    if "address" not in cols:
-        add("address TEXT")
-    if "verified" not in cols:
-        add("verified INTEGER NOT NULL DEFAULT 0")
-    if "verify_code" not in cols:
-        add("verify_code TEXT")
-    if "verify_expires" not in cols:
-        add("verify_expires INTEGER")
-    db.commit()
-
-with app.app_context():
-    ensure_user_columns()
+    try:
+        db = get_db()
+        cur = db.cursor()
+        cur.execute("PRAGMA table_info(users)")
+        have = {row[1] for row in cur.fetchall()}
+        additions = []
+        if "email" not in have:      additions.append("ADD COLUMN email TEXT")
+        if "address" not in have:    additions.append("ADD COLUMN address TEXT")
+        if "is_banned" not in have:  additions.append("ADD COLUMN is_banned INTEGER DEFAULT 0")
+        if "balance" not in have:    additions.append("ADD COLUMN balance REAL DEFAULT 0")
+        if "created_at" not in have: additions.append("ADD COLUMN created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP")
+        for stmt in additions:
+            cur.execute(f"ALTER TABLE users {stmt}")
+        db.commit()
+    except Exception as e:
+        print("[hh] ensure_user_columns warning:", e)
+    finally:
+        try: db.close()
+        except: pass
 
 # ---------- Helpers for validation ------------------------------------------
 def _clean(s): return (s or "").strip()
@@ -999,7 +1038,10 @@ def github_get_file(owner: str, repo: str, path: str, ref: str = "main"):
     if not GITHUB_TOKEN:
         return False, "GITHUB_TOKEN not configured"
     url = f"https://api.github.com/repos/{owner}/{repo}/contents/{path}?ref={ref}"
-    headers = {"Authorization": f"Bearer {GITHUB_TOKEN}", "Accept": "application/vnd.github.v3.raw"}
+    headers = {
+        "Authorization": f"Bearer {GITHUB_TOKEN}",
+        "Accept": "application/vnd.github.v3.raw"
+    }
     ok, resp = _do_request_with_retries("get", url, headers=headers, timeout=10)
     if not ok:
         return False, f"GitHub request failed: {resp}"
@@ -1009,8 +1051,15 @@ def github_create_gist(files: dict, description: str = "", public: bool = False)
     if not GITHUB_TOKEN:
         return False, "GITHUB_TOKEN not configured"
     url = "https://api.github.com/gists"
-    headers = {"Authorization": f"Bearer {GITHUB_TOKEN}", "Content-Type": "application/json"}
-    payload = {"files": {name: {"content": content} for name, content in files.items()}, "description": description, "public": public}
+    headers = {
+        "Authorization": f"Bearer {GITHUB_TOKEN}",
+        "Content-Type": "application/json"
+    }
+    payload = {
+        "files": {name: {"content": content} for name, content in files.items()},
+        "description": description,
+        "public": public
+    }
     ok, resp = _do_request_with_retries("post", url, headers=headers, json_body=payload, timeout=10)
     if not ok:
         return False, f"GitHub gist creation failed: {resp}"
@@ -1020,6 +1069,8 @@ def github_create_gist(files: dict, description: str = "", public: bool = False)
     except Exception:
         return False, "GitHub gist parse error"
 
+# Public read (consider keeping it admin-only if you prefer)
+@limiter.limit("20/minute")
 @app.route("/github/get", methods=["GET"])
 def github_get():
     owner = request.args.get("owner")
@@ -1027,12 +1078,14 @@ def github_get():
     path = request.args.get("path")
     ref = request.args.get("ref", "main")
     if not (owner and repo and path):
-        return jsonify({"error":"owner,repo,path required"}), 400
+        return jsonify({"error": "owner,repo,path required"}), 400
     ok, res = github_get_file(owner, repo, path, ref=ref)
     if not ok:
         return jsonify({"error": res}), 400
     return jsonify({"ok": True, "content": res})
 
+# Admin-only create gist
+@limiter.limit("10/minute")
 @app.route("/github/gist", methods=["POST"])
 @admin_required
 def github_gist():
@@ -1041,7 +1094,7 @@ def github_gist():
     desc = d.get("description", "")
     public = bool(d.get("public", False))
     if not files or not isinstance(files, dict):
-        return jsonify({"error":"files dict required"}), 400
+        return jsonify({"error": "files dict required"}), 400
     ok, res = github_create_gist(files, description=desc, public=public)
     if not ok:
         return jsonify({"error": res}), 400
@@ -1063,6 +1116,9 @@ except Exception as e:
 # ----------------------
 # Run app
 # ----------------------
+# Start background cleanup thread (runs every 6h)
+threading.Thread(target=_cleanup_loop, daemon=True).start()
+
 if __name__ == "__main__":
     port = int(os.getenv("PORT", 5000))
     print("[hh] Starting HumanHelper backend on port", port)
