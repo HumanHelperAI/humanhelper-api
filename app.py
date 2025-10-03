@@ -467,6 +467,14 @@ from flask_limiter.util import get_remote_address
 limiter = Limiter(get_remote_address, app=app, default_limits=["60 per minute"])
 # Example per-route: @limiter.limit("10/minute")
 
+# ----------------------
+# Auth Blueprint
+# ----------------------
+auth_bp = Blueprint("auth", __name__, url_prefix="/auth")
+
+# Register it with the app
+app.register_blueprint(auth_bp)
+
 # unified responses
 def ok(payload: dict | None = None, status: int = 200):
     return jsonify({"ok": True, **(payload or {})}), status
@@ -700,56 +708,33 @@ def ai_status():
         }
     })
 
-# ----------------------
-# Other user endpoints (signup/login/balance/transactions etc.) -- defensive stubs
-# ----------------------
-
-# ===== Registration details + verification (OTP) =============================
+# ===== Registration + OTP verification ======================================
 import re, random
 from datetime import datetime, timedelta, timezone
+from passlib.hash import pbkdf2_sha256
 
-# Simple on-budget “sender” (prints OTP to logs for now)
-# Switch to a real provider later (EMAIL/SMS) – see notes below.
 SEND_VERIFICATION_MODE = os.getenv("SEND_VERIFICATION_MODE", "console")  # console|none
 
 MOBILE_RE = re.compile(r'^[6-9]\d{9}$')   # India 10-digit starting 6–9
 EMAIL_RE  = re.compile(r'^[^@\s]+@[^@\s]+\.[^@\s]+$')
 
-def _otp():
+def _otp() -> str:
     return f"{random.randint(100000, 999999)}"
-
-def _ts(dt: datetime) -> int:
-    return int(dt.timestamp())
 
 def _utcnow() -> datetime:
     return datetime.now(tz=timezone.utc)
 
+def _ts(dt: datetime) -> int:
+    return int(dt.timestamp())
+
+def _now_ts() -> int:
+    return _ts(_utcnow())
+
 def _send_code(destination: str, code: str):
     if SEND_VERIFICATION_MODE == "console":
         print(f"[VERIFY] send code {code} to {destination}")
-    # Later: integrate SMS/email provider here.
-def ensure_user_columns():
-    try:
-        db = get_db()
-        cur = db.cursor()
-        cur.execute("PRAGMA table_info(users)")
-        have = {row[1] for row in cur.fetchall()}
-        additions = []
-        if "email" not in have:      additions.append("ADD COLUMN email TEXT")
-        if "address" not in have:    additions.append("ADD COLUMN address TEXT")
-        if "is_banned" not in have:  additions.append("ADD COLUMN is_banned INTEGER DEFAULT 0")
-        if "balance" not in have:    additions.append("ADD COLUMN balance REAL DEFAULT 0")
-        if "created_at" not in have: additions.append("ADD COLUMN created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP")
-        for stmt in additions:
-            cur.execute(f"ALTER TABLE users {stmt}")
-        db.commit()
-    except Exception as e:
-        print("[hh] ensure_user_columns warning:", e)
-    finally:
-        try: db.close()
-        except: pass
+    # TODO: plug real SMS/Email later.
 
-# ---------- Helpers for validation ------------------------------------------
 def _clean(s): return (s or "").strip()
 
 def validate_registration(data):
@@ -770,59 +755,102 @@ def validate_registration(data):
     if not address or len(address) < 4:
         return False, "address required"
 
-    return True, {"full_name":full_name,"mobile":mobile,"password":password,"email":email,"address":address}
+    return True, {
+        "name": full_name, "mobile": mobile, "password": password,
+        "email": email, "address": address
+    }
 
-# ---------- Endpoints --------------------------------------------------------
-# OTP lifetime
-OTP_TTL_MIN = int(os.getenv("OTP_TTL_MIN", "10"))  # 10 minutes
+# OTP lifetime (minutes)
+OTP_TTL_MIN = int(os.getenv("OTP_TTL_MIN", "10"))
 
-@auth_bp.route("/register", methods=["POST"])
+@auth_bp.post("/register")
 @limiter.limit("10/hour")
 def register():
     """
     JSON: { full_name, mobile, password, email, address }
-    Creates/updates a user record as unverified, generates OTP, sends it.
+    Creates/updates a user record as UNVERIFIED, generates OTP, sends it.
     """
     ok, res = validate_registration(request.get_json(silent=True) or {})
     if not ok:
         return jsonify({"error": res}), 400
 
-    full_name = res["full_name"]
-    mobile    = res["mobile"]
-    password  = res["password"]
-    email     = res["email"]
-    address   = res["address"]
+    name     = res["name"]
+    mobile   = res["mobile"]
+    email    = res["email"]
+    address  = res["address"]
+    pwd_hash = pbkdf2_sha256.hash(res["password"])
 
-    db = get_db()
-    # existing?
-    row = db.execute("SELECT id, verified FROM users WHERE mobile=?", (mobile,)).fetchone()
-
-    code = _otp()
+    code    = _otp()
     expires = _ts(_utcnow() + timedelta(minutes=OTP_TTL_MIN))
 
-    if row:
-        # If already verified, prevent duplicate registration
-        if row["verified"]:
-            return jsonify({"error":"mobile already registered"}), 409
-        # Update unverified user (allow correcting details)
-        db.execute("""
-            UPDATE users SET full_name=?, email=?, address=?, 
-                   password_hash=?, verify_code=?, verify_expires=?
-            WHERE id=?
-        """, (pbkdf2_sha256.hash(password), email, address,
-              pbkdf2_sha256.hash(password), code, expires, row["id"]))
-    else:
-        db.execute("""
-            INSERT INTO users(mobile,password_hash,created_at,full_name,email,address,verified,verify_code,verify_expires)
-            VALUES(?,?,?,?,?,?,?,?,?)
-        """, (mobile, pbkdf2_sha256.hash(password), now_ts(),
-              full_name, email, address, 0, code, expires))
+    db = get_db()
+    cur = db.cursor()
+
+    # If already verified, block duplicate registration
+    row = cur.execute("SELECT id, is_verified FROM users WHERE mobile=?", (mobile,)).fetchone()
+    if row and int(row["is_verified"]) == 1:
+        return jsonify({"error": "mobile already registered"}), 409
+
+    # Upsert (SQLite ≥3.24): on mobile conflict, update the unverified user
+    cur.execute("""
+        INSERT INTO users (name, mobile, email, address, password_hash,
+                           verification_code, is_verified, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, 0, CURRENT_TIMESTAMP)
+        ON CONFLICT(mobile) DO UPDATE SET
+            name=excluded.name,
+            email=excluded.email,
+            address=excluded.address,
+            password_hash=excluded.password_hash,
+            verification_code=excluded.verification_code,
+            is_verified=0
+    """, (name, mobile, email, address, pwd_hash, code))
     db.commit()
 
-    _send_code(mobile if mobile else email, code)
-    # For security, do not include the code in the API response.
-    return jsonify({"message":"verification code sent","mobile":mobile,"expires_in_min":OTP_TTL_MIN}), 201
+    _send_code(mobile, code)
+    return jsonify({"message":"verification code sent",
+                    "mobile": mobile,
+                    "expires_in_min": OTP_TTL_MIN}), 201
 
+@auth_bp.post("/verify")
+@limiter.limit("20/hour")
+def verify():
+    """
+    JSON: { mobile, code }
+    Marks user as verified if OTP matches & not expired.
+    """
+    data   = request.get_json(silent=True) or {}
+    mobile = _clean(data.get("mobile"))
+    code   = _clean(data.get("code"))
+
+    if not MOBILE_RE.match(mobile):
+        return jsonify({"error":"invalid mobile"}), 400
+    if not code or not code.isdigit() or len(code) != 6:
+        return jsonify({"error":"invalid code"}), 400
+
+    db = get_db()
+    cur = db.cursor()
+    row = cur.execute("""
+        SELECT id, verification_code, is_verified, created_at
+        FROM users WHERE mobile=?
+    """, (mobile,)).fetchone()
+
+    if not row:
+        return jsonify({"error":"user not found"}), 404
+    if int(row["is_verified"]) == 1:
+        return jsonify({"message":"already verified"}), 200
+
+    if (row["verification_code"] or "") != code:
+        return jsonify({"error":"incorrect code"}), 400
+
+    # (Optional) If you add a verification_expires column later, check it here.
+
+    cur.execute("""
+        UPDATE users
+        SET is_verified=1, verification_code=NULL
+        WHERE id=?
+    """, (row["id"],))
+    db.commit()
+    return jsonify({"message":"verified"}), 200
 
 @auth_bp.route("/resend-code", methods=["POST"])
 @limiter.limit("5/hour")
@@ -849,40 +877,6 @@ def resend_code():
     db.commit()
     _send_code(mobile, code)
     return jsonify({"message":"verification code re-sent","expires_in_min":OTP_TTL_MIN}), 200
-
-
-@auth_bp.route("/verify", methods=["POST"])
-@limiter.limit("20/hour")
-def verify():
-    """
-    JSON: { mobile, code }
-    Marks user as verified if code matches and not expired.
-    """
-    d = request.get_json(silent=True) or {}
-    mobile = _clean(d.get("mobile"))
-    code   = _clean(d.get("code"))
-    if not MOBILE_RE.match(mobile) or not code.isdigit() or len(code)!=6:
-        return jsonify({"error":"invalid input"}), 400
-
-    db = get_db()
-    row = db.execute("""
-        SELECT id, verify_code, verify_expires, verified 
-        FROM users WHERE mobile=?
-    """, (mobile,)).fetchone()
-    if not row:
-        return jsonify({"error":"not registered"}), 404
-    if row["verified"]:
-        return jsonify({"message":"already verified"}), 200
-
-    if not row["verify_code"] or row["verify_code"] != code:
-        return jsonify({"error":"incorrect code"}), 400
-    if row["verify_expires"] and row["verify_expires"] < now_ts():
-        return jsonify({"error":"code expired"}), 400
-
-    db.execute("UPDATE users SET verified=1, verify_code=NULL, verify_expires=NULL WHERE id=?",
-               (row["id"],))
-    db.commit()
-    return jsonify({"message":"verified"}), 200
 
 
 @auth_bp.route("/login", methods=["POST"])
@@ -942,6 +936,46 @@ def me():
         "verified":bool(row["verified"])
     }), 200
 # ===== /Registration + verification =========================================
+
+def ensure_user_columns():
+    conn = get_db()
+    cur = conn.cursor()
+    # base table
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS users(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT,
+            mobile TEXT UNIQUE,
+            email TEXT,
+            address TEXT,
+            password_hash TEXT,
+            verification_code TEXT,
+            is_verified INTEGER DEFAULT 0,
+            is_banned INTEGER DEFAULT 0,
+            balance REAL DEFAULT 0,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP                                                        )
+    """)
+    # add missing columns defensively
+    cur.execute("PRAGMA table_info(users)")
+    have = {row["name"] for row in cur.fetchall()}
+    wanted = {
+        "name":"TEXT",
+        "mobile":"TEXT",
+        "email":"TEXT",
+        "address":"TEXT",
+        "password_hash":"TEXT",
+        "verification_code":"TEXT",
+        "is_verified":"INTEGER DEFAULT 0",
+        "is_banned":"INTEGER DEFAULT 0",
+        "balance":"REAL DEFAULT 0",
+        "created_at":"TIMESTAMP DEFAULT CURRENT_TIMESTAMP",
+    }
+    for col, typ in wanted.items():
+        if col not in have:
+            cur.execute(f"ALTER TABLE users ADD COLUMN {col} {typ}")
+    conn.commit()
+    conn.close()
+
 @auth_bp.route("/refresh", methods=["POST"])
 def refresh():
     """
