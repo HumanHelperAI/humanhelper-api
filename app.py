@@ -12,38 +12,8 @@ from functools import wraps
 import requests
 from flask import Flask, request, jsonify, Blueprint
 from flask_cors import CORS
-
-from flask_limiter import Limiter
-from flask_limiter.util import get_remote_address
-
 import re, json, logging
 from werkzeug.exceptions import HTTPException
-
-# unified responses
-def ok(payload: dict = None, status: int = 200):
-    return jsonify({"ok": True, **(payload or {})}), status
-
-def err(message: str, status: int = 400, code: str = "bad_request", extra: dict | None = None):
-    body = {"ok": False, "error": {"code": code, "message": message}}
-    if extra: body["error"].update(extra)
-    return jsonify(body), status
-
-# JSON errors for everything
-@app.errorhandler(HTTPException)
-def _http_exc(e: HTTPException):
-    return err(e.description or "HTTP error", e.code or 500, code=str(e.code))
-
-@app.errorhandler(Exception)
-def _uncaught(e: Exception):
-    app.logger.exception("uncaught_exception")
-    return err("Internal server error", 500, code="internal_error")
-
-# load .env if present
-try:
-    from dotenv import load_dotenv
-    load_dotenv()
-except Exception:
-    pass
 
 # ----------------------
 # Defensive local modules (stubs if missing)
@@ -442,25 +412,41 @@ ALLOWED_ORIGINS = {
     "https://humanhelperai.github.io",
 }
 
+# Use ONE CORS strategy. (A) Flask-Cors:
+from flask_cors import CORS
+CORS(app, resources={r"*": {"origins": ALLOWED_ORIGINS}}, supports_credentials=False)
+
+# If you prefer manual headers instead, keep add_cors_headers() below and delete the CORS(...) line.
+
+from flask_limiter import Limiter
+from flask_limiter.util import get_remote_address
+limiter = Limiter(get_remote_address, app=app, default_limits=["60 per minute"])
+# Example per-route: @limiter.limit("10/minute")
+
+# unified responses
+def ok(payload: dict | None = None, status: int = 200):
+    return jsonify({"ok": True, **(payload or {})}), status
+
+def err(message: str, status: int = 400, code: str = "bad_request", extra: dict | None = None):
+    body = {"ok": False, "error": {"code": code, "message": message}}
+    if extra: body["error"].update(extra)
+    return jsonify(body), status
+
+from werkzeug.exceptions import HTTPException
+
+@app.errorhandler(HTTPException)
+def _http_exc(e: HTTPException):
+    return err(e.description or "HTTP error", e.code or 500, code=str(e.code))
+
+@app.errorhandler(Exception)
+def _uncaught(e: Exception):
+    app.logger.exception("uncaught_exception")
+    return err("Internal server error", 500, code="internal_error")
+
 def _cors_origin(origin: str) -> str | None:
     if not origin:
         return None
-    # exact match
-    if origin in ALLOWED_ORIGINS:
-        return origin
-    return None
-
-@app.after_request
-def add_cors_headers(response):
-    origin = request.headers.get("Origin", "")
-    allow = _cors_origin(origin)
-    if allow:
-        response.headers["Access-Control-Allow-Origin"] = allow
-        response.headers["Vary"] = "Origin"
-    response.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS, PUT, DELETE"
-    response.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization, X-Requested-With, X-Admin-Token, X-Premium"
-    response.headers["Access-Control-Max-Age"] = "86400"
-    return response
+    return origin if origin in ALLOWED_ORIGINS else None
 
 @app.after_request
 def add_security_headers(resp):
@@ -516,16 +502,8 @@ threading.Thread(target=_cleanup_loop, daemon=True).start()
 def root():
     return jsonify({"message":"Human Helper API is live", "status":"ok"}), 200
 
-# Rate limit: 60 requests per minute per client IP (default)
-limiter = Limiter(
-    key_func=get_remote_address,
-    default_limits=["60/minute"],
-)
-limiter.init_app(app)
-
 # Optional: don’t rate-limit health checks
 @limiter.exempt
-
 @app.route("/health", methods=["GET"])
 def health():
     return jsonify({"message":"Human Helper API is live", "status":"ok"}), 200
