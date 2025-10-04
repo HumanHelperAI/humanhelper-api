@@ -33,8 +33,6 @@ def get_db():
     return conn
 
 # ✅ Ensure users table and columns exist before app starts
-
-# ✅ Ensure users table and columns exist before app starts
 def ensure_user_columns():
     conn = get_db()
     cur = conn.cursor()
@@ -79,7 +77,6 @@ def ensure_user_columns():
 
     conn.commit()
     conn.close()
-
 
 def ensure_auth_tables():
     """Create refresh token table and indexes if missing (idempotent)."""
@@ -190,7 +187,8 @@ LLAMA_TIMEOUT = int(os.getenv("LLAMA_TIMEOUT", DEFAULT_REQ_TIMEOUT))
 # free models priority: comma separated like "openrouter:gpt-oss-20b,deepseek:deepseek-v3.1-free"
 FREE_MODELS_PRIORITY = [m.strip() for m in os.getenv("FREE_MODELS_PRIORITY", "").split(",") if m.strip()]
 
-# Make sure we have sane defaults (fallback list if env empty)
+# ==== JWT config & helpers ====================================================
+
 if not FREE_MODELS_PRIORITY:
     FREE_MODELS_PRIORITY = [
         "openrouter:gpt-oss-20b",
@@ -201,63 +199,59 @@ if not FREE_MODELS_PRIORITY:
         "google:gemini-2.0-flash-exp"
     ]
 
-JWT_SECRET = os.getenv("JWT_SECRET", "change-this-in-railway")
-JWT_ALGO   = "HS256"
-ACCESS_TTL_MIN  = int(os.getenv("ACCESS_TTL_MIN", "30"))   # 30 minutes
-REFRESH_TTL_DAYS = int(os.getenv("REFRESH_TTL_DAYS", "30"))# 30 days
-
-# ==== JWT config & helpers ====================================================
-import time, uuid, secrets
-import jwt
-from flask import g
-
-JWT_SECRET = os.getenv("JWT_SECRET", "change-me-in-prod")
-JWT_ISS = "humanhelper.ai"
-
-ACCESS_TTL = int(os.getenv("JWT_ACCESS_TTL_MIN", "15")) * 60         # seconds
-REFRESH_TTL = int(os.getenv("JWT_REFRESH_TTL_DAYS", "30")) * 86400    # seconds
+#++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
 
 def _now() -> int: return int(time.time())
 def _make_jti() -> str: return uuid.uuid4().hex
 
+JWT_SECRET = os.getenv("JWT_SECRET", "change-this-in-railway")
+JWT_ALGO   = "HS256"
+ACCESS_TTL_MIN   = int(os.getenv("ACCESS_TTL_MIN", "30"))
+REFRESH_TTL_DAYS = int(os.getenv("REFRESH_TTL_DAYS", "30"))
+
+def _utcnow(): return datetime.now(timezone.utc)
+def _now_ts(): return int(_utcnow().timestamp())
+
 def make_access_token(user_id: int, mobile: str) -> str:
+    now = _utcnow()
+    exp = now + timedelta(minutes=ACCESS_TTL_MIN)
     payload = {
-        "iss": JWT_ISS, "sub": int(user_id), "mobile": mobile,
-        "type": "access", "iat": _now(), "exp": _now() + ACCESS_TTL
+        "type": "access",
+        "sub": str(user_id),
+        "mobile": mobile,
+        "iat": int(now.timestamp()),
+        "exp": int(exp.timestamp()),
+        "jti": str(uuid.uuid4())
     }
-    return jwt.encode(payload, JWT_SECRET, algorithm="HS256")
+    return jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALGO)
 
 def make_refresh_token(user_id: int) -> str:
-    # ensure table exists (safe to run repeatedly)
-    conn = get_db()
-    cur = conn.cursor()
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS refresh_tokens(
-            jti TEXT PRIMARY KEY,
-            user_id INTEGER NOT NULL,
-            revoked INTEGER DEFAULT 0,
-            expires_at INTEGER NOT NULL
-        )
-    """)
-    jti = _make_jti()
-    exp = _now() + REFRESH_TTL
-    cur.execute("INSERT INTO refresh_tokens(jti,user_id,expires_at) VALUES(?,?,?)",
-                (jti, user_id, exp))
-    conn.commit()
-    conn.close()
-
+    now = _utcnow()
+    exp = now + timedelta(days=REFRESH_TTL_DAYS)
+    jti = str(uuid.uuid4())
     payload = {
-        "iss": JWT_ISS, "sub": int(user_id),
-        "type": "refresh", "jti": jti, "iat": _now(), "exp": exp
+        "type": "refresh",
+        "sub": str(user_id),
+        "iat": int(now.timestamp()),
+        "exp": int(exp.timestamp()),
+        "jti": jti
     }
-    return jwt.encode(payload, JWT_SECRET, algorithm="HS256")
+    token = jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALGO)
 
-def decode_token(token: str) -> dict | None:
+    conn = get_db()
+    conn.execute(
+        "INSERT INTO refresh_tokens (jti,user_id,issued_at,expires_at,revoked) VALUES (?,?,?,?,0)",
+        (jti, user_id, int(now.timestamp()), int(exp.timestamp()))
+    )
+    conn.commit(); conn.close()
+    return token
+
+def decode_token(token: str):
     try:
-        return jwt.decode(token, JWT_SECRET, algorithms=["HS256"], issuer=JWT_ISS)
+        return jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGO])
     except jwt.ExpiredSignatureError:
         return None
-    except Exception:
+    except jwt.InvalidTokenError:
         return None
 
 def auth_required(fn):
@@ -586,17 +580,17 @@ def user_ban():
 # ----------------------
 # Flask app init
 # ----------------------
-
 app = Flask(__name__)
 
 # --- Initialize SQLite DB on startup ---
 try:
     init_db()
     ensure_user_columns()
-    ensure_auth_tables()    
-print("[hh] Database initialized ✅")
+    ensure_auth_tables()  # make sure refresh_tokens exists
+    print("[hh] Database initialized ✅")
 except Exception as e:
     print("[hh] Database init warning:", e)
+
 # Allowed origins for browsers
 ALLOWED_ORIGINS = {
     "http://127.0.0.1:5000",
@@ -863,7 +857,6 @@ def ai_status():
 # =======================
 
 def _utcnow(): return datetime.now(timezone.utc)
-def _now_ts(): return int(_utcnow().timestamp.()
 def _otp(): return f"{random.randint(100000,999999)}"
 
 MOBILE_IN_RE = re.compile(r'^[6-9]\d{9}$')          # India mobile
@@ -1013,25 +1006,28 @@ def refresh():
     token = (data.get("refresh") or "").strip()
     payload = decode_token(token)
     if not payload or payload.get("type") != "refresh":
-        return jsonify({"error":"invalid or expired refresh"}), 401
+        return jsonify({"error": "invalid or expired refresh"}), 401
 
-    jti = payload.get("jti","")
+    jti = payload.get("jti", "")
     conn = get_db()
     row = conn.execute(
         "SELECT user_id, revoked, expires_at FROM refresh_tokens WHERE jti=?", (jti,)
     ).fetchone()
     if (not row) or row["revoked"] or row["expires_at"] < _now_ts():
         conn.close()
-        return jsonify({"error":"refresh revoked/expired"}), 401
+        return jsonify({"error": "refresh revoked/expired"}), 401
 
     # rotate: revoke current, issue new
     conn.execute("UPDATE refresh_tokens SET revoked=1 WHERE jti=?", (jti,))
-conn.commit()
+    conn.commit()   # ✅ must be indented to the same level as conn.execute
+
     # fetch mobile for claim
-    mrow = conn.execute("SELECT mobile FROM users WHERE id=?", (row["user_id"],)).fetchone()
+    mrow = conn.execute(
+        "SELECT mobile FROM users WHERE id=?", (row["user_id"],)
+    ).fetchone()
     conn.close()
 
-    new_access  = make_access_token(row["user_id"], mrow["mobile"])
+    new_access = make_access_token(row["user_id"], mrow["mobile"])
     new_refresh = make_refresh_token(row["user_id"])
     return jsonify({"access": new_access, "refresh": new_refresh}), 200
 
