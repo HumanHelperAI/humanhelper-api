@@ -14,9 +14,10 @@ from flask import Flask, request, jsonify, Blueprint, g
 import jwt, secrets, uuid
 from datetime import datetime, timedelta, timezone
 from flask_cors import CORS
-import re, json, logging
+import re, json, logging 
 from werkzeug.exceptions import HTTPException
 from passlib.hash import pbkdf2_sha256
+
 # --- SQLite helper for Termux/mobile ---
 import sqlite3
 DB_PATH = os.getenv("DATABASE_URL", "db.sqlite3")
@@ -32,11 +33,12 @@ def get_db():
     return conn
 
 # ✅ Ensure users table and columns exist before app starts
+
+# ✅ Ensure users table and columns exist before app starts
 def ensure_user_columns():
     conn = get_db()
     cur = conn.cursor()
 
-    # Base table (creates if missing)
     cur.execute("""
         CREATE TABLE IF NOT EXISTS users(
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -65,29 +67,12 @@ def ensure_user_columns():
         "address": "TEXT",
         "password_hash": "TEXT",
         "verification_code": "TEXT",
-        "verify_expires": "INTEGER",              # OTP expiry (epoch seconds)
+        "verify_expires": "INTEGER",                 # OTP expiry (epoch seconds)
         "is_verified": "INTEGER DEFAULT 0",
         "is_banned": "INTEGER DEFAULT 0",
         "balance": "REAL DEFAULT 0",
         "created_at": "TIMESTAMP DEFAULT CURRENT_TIMESTAMP",
     }
-
-def ensure_refresh_table():
-    conn = get_db()
-    cur = conn.cursor()
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS refresh_tokens (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            jti TEXT UNIQUE,
-            user_id INTEGER,
-            issued_at INTEGER,
-            expires_at INTEGER,
-            revoked INTEGER DEFAULT 0
-        )
-    """)
-    conn.commit()
-    conn.close()
-
     for col, typ in wanted.items():
         if col not in have:
             cur.execute(f"ALTER TABLE users ADD COLUMN {col} {typ}")
@@ -95,17 +80,24 @@ def ensure_refresh_table():
     conn.commit()
     conn.close()
 
+
 def ensure_auth_tables():
+    """Create refresh token table and indexes if missing (idempotent)."""
     conn = get_db()
     cur = conn.cursor()
     cur.execute("""
         CREATE TABLE IF NOT EXISTS refresh_tokens(
             jti TEXT PRIMARY KEY,
             user_id INTEGER NOT NULL,
-            revoked INTEGER DEFAULT 0,
-            expires_at INTEGER NOT NULL
+            issued_at INTEGER NOT NULL,
+            expires_at INTEGER NOT NULL,
+            revoked INTEGER NOT NULL DEFAULT 0,
+            FOREIGN KEY(user_id) REFERENCES users(id)
         )
     """)
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_refresh_user ON refresh_tokens(user_id)")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_refresh_exp  ON refresh_tokens(expires_at)")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_refresh_rev  ON refresh_tokens(revoked)")
     conn.commit()
     conn.close()
 
@@ -601,7 +593,8 @@ app = Flask(__name__)
 try:
     init_db()
     ensure_user_columns()
-    print("[hh] Database initialized ✅")
+    ensure_auth_tables()    
+print("[hh] Database initialized ✅")
 except Exception as e:
     print("[hh] Database init warning:", e)
 # Allowed origins for browsers
@@ -868,77 +861,9 @@ def ai_status():
 # =======================
 # Auth blueprint + routes
 # =======================
-from datetime import datetime, timedelta, timezone
-import re
-from passlib.hash import pbkdf2_sha256
 
 def _utcnow(): return datetime.now(timezone.utc)
-def _now_ts(): return int(_utcnow().timestamp())
-
-def make_access_token(user_id: int, mobile: str) -> str:
-    now  = _utcnow()
-    exp  = now + timedelta(minutes=ACCESS_TTL_MIN)
-    payload = {
-        "type": "access",
-        "sub": str(user_id),
-        "mobile": mobile,
-        "iat": int(now.timestamp()),
-        "exp": int(exp.timestamp()),
-        "jti": str(uuid.uuid4())
-    }
-    return jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALGO)
-
-def make_refresh_token(user_id: int) -> str:
-    now  = _utcnow()
-    exp  = now + timedelta(days=REFRESH_TTL_DAYS)
-    jti  = str(uuid.uuid4())
-    payload = {
-        "type": "refresh",
-        "sub": str(user_id),
-        "iat": int(now.timestamp()),
-        "exp": int(exp.timestamp()),
-        "jti": jti
-    }
-    token = jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALGO)
-
-    conn = get_db()
-    conn.execute(
-        "INSERT INTO refresh_tokens (jti,user_id,issued_at,expires_at,revoked) VALUES (?,?,?,?,0)",
-        (jti, user_id, int(now.timestamp()), int(exp.timestamp()))
-    )
-    conn.commit(); conn.close()
-    return token
-
-def decode_token(token: str):
-    try:
-        return jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGO])
-    except jwt.ExpiredSignatureError:
-        return None
-    except jwt.InvalidTokenError:
-        return None
-
-def clean_expired_refresh():
-    conn = get_db()
-    conn.execute("DELETE FROM refresh_tokens WHERE expires_at < ?", (_now_ts(),))
-    conn.commit(); conn.close()
-
-# decorator
-from functools import wraps
-def auth_required(f):
-    @wraps(f)
-    def _w(*args, **kwargs):
-        auth = request.headers.get("Authorization","")
-        if not auth.startswith("Bearer "):
-            return jsonify({"error":"missing bearer token"}), 401
-        token = auth.split(" ",1)[1].strip()
-        payload = decode_token(token)
-        if not payload or payload.get("type") != "access":
-            return jsonify({"error":"invalid or expired token"}), 401
-        g.user_id = int(payload.get("sub", "0"))
-        g.mobile  = payload.get("mobile", "")
-        return f(*args, **kwargs)
-    return _w
-
+def _now_ts(): return int(_utcnow().timestamp.()
 def _otp(): return f"{random.randint(100000,999999)}"
 
 MOBILE_IN_RE = re.compile(r'^[6-9]\d{9}$')          # India mobile
@@ -971,6 +896,7 @@ def register():
     if len(address) < 4:                       return jsonify({"error":"address required"}), 400
 
     code    = _otp()
+
     expires = _now_ts() + OTP_TTL_MIN*60
     pwd_hash = pbkdf2_sha256.hash(password)
 
@@ -1100,7 +1026,7 @@ def refresh():
 
     # rotate: revoke current, issue new
     conn.execute("UPDATE refresh_tokens SET revoked=1 WHERE jti=?", (jti,))
-    conn.commit()
+conn.commit()
     # fetch mobile for claim
     mrow = conn.execute("SELECT mobile FROM users WHERE id=?", (row["user_id"],)).fetchone()
     conn.close()
