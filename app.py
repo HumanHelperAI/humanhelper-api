@@ -10,12 +10,13 @@ from typing import Tuple, Optional, Any, Dict, List
 from functools import wraps
 
 import requests
-from flask import Flask, request, jsonify, Blueprint
+from flask import Flask, request, jsonify, Blueprint, g
+import jwt, secrets, uuid
+from datetime import datetime, timedelta, timezone
 from flask_cors import CORS
 import re, json, logging
 from werkzeug.exceptions import HTTPException
 from passlib.hash import pbkdf2_sha256
-
 # --- SQLite helper for Termux/mobile ---
 import sqlite3
 DB_PATH = os.getenv("DATABASE_URL", "db.sqlite3")
@@ -71,10 +72,40 @@ def ensure_user_columns():
         "created_at": "TIMESTAMP DEFAULT CURRENT_TIMESTAMP",
     }
 
+def ensure_refresh_table():
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS refresh_tokens (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            jti TEXT UNIQUE,
+            user_id INTEGER,
+            issued_at INTEGER,
+            expires_at INTEGER,
+            revoked INTEGER DEFAULT 0
+        )
+    """)
+    conn.commit()
+    conn.close()
+
     for col, typ in wanted.items():
         if col not in have:
             cur.execute(f"ALTER TABLE users ADD COLUMN {col} {typ}")
 
+    conn.commit()
+    conn.close()
+
+def ensure_auth_tables():
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS refresh_tokens(
+            jti TEXT PRIMARY KEY,
+            user_id INTEGER NOT NULL,
+            revoked INTEGER DEFAULT 0,
+            expires_at INTEGER NOT NULL
+        )
+    """)
     conn.commit()
     conn.close()
 
@@ -177,6 +208,87 @@ if not FREE_MODELS_PRIORITY:
         "nousresearch:deephermes-3-llama-3-8b-preview",
         "google:gemini-2.0-flash-exp"
     ]
+
+JWT_SECRET = os.getenv("JWT_SECRET", "change-this-in-railway")
+JWT_ALGO   = "HS256"
+ACCESS_TTL_MIN  = int(os.getenv("ACCESS_TTL_MIN", "30"))   # 30 minutes
+REFRESH_TTL_DAYS = int(os.getenv("REFRESH_TTL_DAYS", "30"))# 30 days
+
+# ==== JWT config & helpers ====================================================
+import time, uuid, secrets
+import jwt
+from flask import g
+
+JWT_SECRET = os.getenv("JWT_SECRET", "change-me-in-prod")
+JWT_ISS = "humanhelper.ai"
+
+ACCESS_TTL = int(os.getenv("JWT_ACCESS_TTL_MIN", "15")) * 60         # seconds
+REFRESH_TTL = int(os.getenv("JWT_REFRESH_TTL_DAYS", "30")) * 86400    # seconds
+
+def _now() -> int: return int(time.time())
+def _make_jti() -> str: return uuid.uuid4().hex
+
+def make_access_token(user_id: int, mobile: str) -> str:
+    payload = {
+        "iss": JWT_ISS, "sub": int(user_id), "mobile": mobile,
+        "type": "access", "iat": _now(), "exp": _now() + ACCESS_TTL
+    }
+    return jwt.encode(payload, JWT_SECRET, algorithm="HS256")
+
+def make_refresh_token(user_id: int) -> str:
+    # ensure table exists (safe to run repeatedly)
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS refresh_tokens(
+            jti TEXT PRIMARY KEY,
+            user_id INTEGER NOT NULL,
+            revoked INTEGER DEFAULT 0,
+            expires_at INTEGER NOT NULL
+        )
+    """)
+    jti = _make_jti()
+    exp = _now() + REFRESH_TTL
+    cur.execute("INSERT INTO refresh_tokens(jti,user_id,expires_at) VALUES(?,?,?)",
+                (jti, user_id, exp))
+    conn.commit()
+    conn.close()
+
+    payload = {
+        "iss": JWT_ISS, "sub": int(user_id),
+        "type": "refresh", "jti": jti, "iat": _now(), "exp": exp
+    }
+    return jwt.encode(payload, JWT_SECRET, algorithm="HS256")
+
+def decode_token(token: str) -> dict | None:
+    try:
+        return jwt.decode(token, JWT_SECRET, algorithms=["HS256"], issuer=JWT_ISS)
+    except jwt.ExpiredSignatureError:
+        return None
+    except Exception:
+        return None
+
+def auth_required(fn):
+    @wraps(fn)
+    def _wrap(*a, **k):
+        auth = request.headers.get("Authorization", "")
+        if not auth.startswith("Bearer "):
+            return jsonify({"error":"missing token"}), 401
+        payload = decode_token(auth.split(" ",1)[1])
+        if not payload or payload.get("type") != "access":
+            return jsonify({"error":"invalid or expired token"}), 401
+        g.user_id = int(payload["sub"])
+        g.mobile = payload.get("mobile") or ""
+        return fn(*a, **k)
+    return _wrap
+
+def clean_expired_refresh():
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute("DELETE FROM refresh_tokens WHERE expires_at < ?", (_now(),))
+    conn.commit()
+    conn.close()
+# ==== /JWT ====================================================================
 
 # ----------------------
 # Utilities: HTTP with retries/backoff
@@ -762,6 +874,71 @@ from passlib.hash import pbkdf2_sha256
 
 def _utcnow(): return datetime.now(timezone.utc)
 def _now_ts(): return int(_utcnow().timestamp())
+
+def make_access_token(user_id: int, mobile: str) -> str:
+    now  = _utcnow()
+    exp  = now + timedelta(minutes=ACCESS_TTL_MIN)
+    payload = {
+        "type": "access",
+        "sub": str(user_id),
+        "mobile": mobile,
+        "iat": int(now.timestamp()),
+        "exp": int(exp.timestamp()),
+        "jti": str(uuid.uuid4())
+    }
+    return jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALGO)
+
+def make_refresh_token(user_id: int) -> str:
+    now  = _utcnow()
+    exp  = now + timedelta(days=REFRESH_TTL_DAYS)
+    jti  = str(uuid.uuid4())
+    payload = {
+        "type": "refresh",
+        "sub": str(user_id),
+        "iat": int(now.timestamp()),
+        "exp": int(exp.timestamp()),
+        "jti": jti
+    }
+    token = jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALGO)
+
+    conn = get_db()
+    conn.execute(
+        "INSERT INTO refresh_tokens (jti,user_id,issued_at,expires_at,revoked) VALUES (?,?,?,?,0)",
+        (jti, user_id, int(now.timestamp()), int(exp.timestamp()))
+    )
+    conn.commit(); conn.close()
+    return token
+
+def decode_token(token: str):
+    try:
+        return jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGO])
+    except jwt.ExpiredSignatureError:
+        return None
+    except jwt.InvalidTokenError:
+        return None
+
+def clean_expired_refresh():
+    conn = get_db()
+    conn.execute("DELETE FROM refresh_tokens WHERE expires_at < ?", (_now_ts(),))
+    conn.commit(); conn.close()
+
+# decorator
+from functools import wraps
+def auth_required(f):
+    @wraps(f)
+    def _w(*args, **kwargs):
+        auth = request.headers.get("Authorization","")
+        if not auth.startswith("Bearer "):
+            return jsonify({"error":"missing bearer token"}), 401
+        token = auth.split(" ",1)[1].strip()
+        payload = decode_token(token)
+        if not payload or payload.get("type") != "access":
+            return jsonify({"error":"invalid or expired token"}), 401
+        g.user_id = int(payload.get("sub", "0"))
+        g.mobile  = payload.get("mobile", "")
+        return f(*args, **kwargs)
+    return _w
+
 def _otp(): return f"{random.randint(100000,999999)}"
 
 MOBILE_IN_RE = re.compile(r'^[6-9]\d{9}$')          # India mobile
@@ -868,7 +1045,7 @@ def resend_code():
     return jsonify({"message":"verification code re-sent","expires_in_min":OTP_TTL_MIN}), 200
 
 @auth_bp.post("/login")
-@limiter.limit("30/hour")
+@limiter.limit("5/minute;50/hour")
 def login():
     d = request.get_json(silent=True) or {}
     mobile = _clean(d.get("mobile"))
@@ -882,22 +1059,82 @@ def login():
         (mobile,)
     ).fetchone()
     db.close()
+
     if not row:                       return jsonify({"error":"user not found"}), 404
     if row["is_banned"]:              return jsonify({"error":"account banned"}), 403
     if not row["is_verified"]:        return jsonify({"error":"not verified"}), 403
     if not pbkdf2_sha256.verify(password, row["password_hash"]):
         return jsonify({"error":"invalid credentials"}), 401
 
+    # ✅ these MUST be inside the function and aligned here
+    access  = make_access_token(row["id"], mobile)
+    refresh = make_refresh_token(row["id"])
+
     return jsonify({
         "ok": True,
         "user": {
-            "id": row["id"],
-            "name": row["name"],
-            "mobile": mobile,
-            "email": row["email"],
-            "address": row["address"],
-        }
+            "id": row["id"], "name": row["name"], "mobile": mobile,
+            "email": row["email"], "address": row["address"]
+        },
+        "access": access,
+        "refresh": refresh
     }), 200
+
+@auth_bp.post("/refresh")
+def refresh():
+    """JSON: { refresh }  -> returns new access + rotated refresh"""
+    data = request.get_json(silent=True) or {}
+    token = (data.get("refresh") or "").strip()
+    payload = decode_token(token)
+    if not payload or payload.get("type") != "refresh":
+        return jsonify({"error":"invalid or expired refresh"}), 401
+
+    jti = payload.get("jti","")
+    conn = get_db()
+    row = conn.execute(
+        "SELECT user_id, revoked, expires_at FROM refresh_tokens WHERE jti=?", (jti,)
+    ).fetchone()
+    if (not row) or row["revoked"] or row["expires_at"] < _now_ts():
+        conn.close()
+        return jsonify({"error":"refresh revoked/expired"}), 401
+
+    # rotate: revoke current, issue new
+    conn.execute("UPDATE refresh_tokens SET revoked=1 WHERE jti=?", (jti,))
+    conn.commit()
+    # fetch mobile for claim
+    mrow = conn.execute("SELECT mobile FROM users WHERE id=?", (row["user_id"],)).fetchone()
+    conn.close()
+
+    new_access  = make_access_token(row["user_id"], mrow["mobile"])
+    new_refresh = make_refresh_token(row["user_id"])
+    return jsonify({"access": new_access, "refresh": new_refresh}), 200
+
+@auth_bp.post("/logout")
+def logout():
+    """JSON: { refresh }  -> revoke this refresh token"""
+    data = request.get_json(silent=True) or {}
+    token = (data.get("refresh") or "").strip()
+    payload = decode_token(token)
+    if not payload or payload.get("type") != "refresh":
+        return jsonify({"error":"invalid refresh"}), 400
+    jti = payload.get("jti","")
+    conn = get_db()
+    conn.execute("UPDATE refresh_tokens SET revoked=1 WHERE jti=?", (jti,))
+    conn.commit()
+    conn.close()
+    return jsonify({"message":"logged out"}), 200
+
+@app.before_request
+def _maybe_purge():
+    # ~1% of requests purge old refresh tokens
+    if random.randint(1,100) == 1:
+        try: clean_expired_refresh()
+        except Exception: pass
+
+@app.get("/whoami")
+@auth_required
+def whoami():
+    return jsonify({"user_id": g.user_id, "mobile": g.mobile})
 
 # register blueprint once
 app.register_blueprint(auth_bp)
