@@ -30,6 +30,54 @@ def get_db():
     conn.row_factory = sqlite3.Row
     return conn
 
+# ✅ Ensure users table and columns exist before app starts
+def ensure_user_columns():
+    conn = get_db()
+    cur = conn.cursor()
+
+    # Base table (creates if missing)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS users(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT,
+            mobile TEXT UNIQUE,
+            email TEXT,
+            address TEXT,
+            password_hash TEXT,
+            verification_code TEXT,
+            verify_expires INTEGER,
+            is_verified INTEGER DEFAULT 0,
+            is_banned INTEGER DEFAULT 0,
+            balance REAL DEFAULT 0,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+
+    # Add any missing columns defensively
+    cur.execute("PRAGMA table_info(users)")
+    have = {row["name"] for row in cur.fetchall()}
+
+    wanted = {
+        "name": "TEXT",
+        "mobile": "TEXT",
+        "email": "TEXT",
+        "address": "TEXT",
+        "password_hash": "TEXT",
+        "verification_code": "TEXT",
+        "verify_expires": "INTEGER",              # OTP expiry (epoch seconds)
+        "is_verified": "INTEGER DEFAULT 0",
+        "is_banned": "INTEGER DEFAULT 0",
+        "balance": "REAL DEFAULT 0",
+        "created_at": "TIMESTAMP DEFAULT CURRENT_TIMESTAMP",
+    }
+
+    for col, typ in wanted.items():
+        if col not in have:
+            cur.execute(f"ALTER TABLE users ADD COLUMN {col} {typ}")
+
+    conn.commit()
+    conn.close()
+
 try:
     from database import init_db, run_query, cleanup_old_logs
 except Exception:
@@ -472,9 +520,6 @@ limiter = Limiter(get_remote_address, app=app, default_limits=["60 per minute"])
 # ----------------------
 auth_bp = Blueprint("auth", __name__, url_prefix="/auth")
 
-# Register it with the app
-app.register_blueprint(auth_bp)
-
 # unified responses
 def ok(payload: dict | None = None, status: int = 200):
     return jsonify({"ok": True, **(payload or {})}), status
@@ -708,360 +753,154 @@ def ai_status():
         }
     })
 
-# ===== Registration + OTP verification ======================================
-import re, random
+# =======================
+# Auth blueprint + routes
+# =======================
 from datetime import datetime, timedelta, timezone
+import re
 from passlib.hash import pbkdf2_sha256
 
-SEND_VERIFICATION_MODE = os.getenv("SEND_VERIFICATION_MODE", "console")  # console|none
+def _utcnow(): return datetime.now(timezone.utc)
+def _now_ts(): return int(_utcnow().timestamp())
+def _otp(): return f"{random.randint(100000,999999)}"
 
-MOBILE_RE = re.compile(r'^[6-9]\d{9}$')   # India 10-digit starting 6–9
-EMAIL_RE  = re.compile(r'^[^@\s]+@[^@\s]+\.[^@\s]+$')
+MOBILE_IN_RE = re.compile(r'^[6-9]\d{9}$')          # India mobile
+EMAIL_RE = re.compile(r'^[^@\s]+@[^@\s]+\.[^@\s]+$')
+OTP_TTL_MIN = int(os.getenv("OTP_TTL_MIN","10"))
+SEND_VERIFICATION_MODE = os.getenv("SEND_VERIFICATION_MODE","console")
 
-def _otp() -> str:
-    return f"{random.randint(100000, 999999)}"
-
-def _utcnow() -> datetime:
-    return datetime.now(tz=timezone.utc)
-
-def _ts(dt: datetime) -> int:
-    return int(dt.timestamp())
-
-def _now_ts() -> int:
-    return _ts(_utcnow())
-
-def _send_code(destination: str, code: str):
+def _send_code(dest: str, code: str):
     if SEND_VERIFICATION_MODE == "console":
-        print(f"[VERIFY] send code {code} to {destination}")
-    # TODO: plug real SMS/Email later.
+        print(f"[VERIFY] send code {code} to {dest}")
+
+auth_bp = Blueprint("auth", __name__, url_prefix="/auth")
 
 def _clean(s): return (s or "").strip()
-
-def validate_registration(data):
-    full_name = _clean(data.get("full_name"))
-    mobile    = _clean(data.get("mobile"))
-    password  = data.get("password") or ""
-    email     = _clean(data.get("email"))
-    address   = _clean(data.get("address"))
-
-    if not full_name or len(full_name) < 2:
-        return False, "full_name required"
-    if not MOBILE_RE.match(mobile):
-        return False, "invalid mobile (10-digit India number)"
-    if len(password) < 8:
-        return False, "password must be at least 8 chars"
-    if email and not EMAIL_RE.match(email):
-        return False, "invalid email"
-    if not address or len(address) < 4:
-        return False, "address required"
-
-    return True, {
-        "name": full_name, "mobile": mobile, "password": password,
-        "email": email, "address": address
-    }
-
-# OTP lifetime (minutes)
-OTP_TTL_MIN = int(os.getenv("OTP_TTL_MIN", "10"))
 
 @auth_bp.post("/register")
 @limiter.limit("10/hour")
 def register():
-    """
-    JSON: { full_name, mobile, password, email, address }
-    Creates/updates a user record as UNVERIFIED, generates OTP, sends it.
-    """
-    ok, res = validate_registration(request.get_json(silent=True) or {})
-    if not ok:
-        return jsonify({"error": res}), 400
+    d = request.get_json(silent=True) or {}
+    name     = _clean(d.get("full_name"))
+    mobile   = _clean(d.get("mobile"))
+    password = d.get("password") or ""
+    email    = _clean(d.get("email"))
+    address  = _clean(d.get("address"))
 
-    name     = res["name"]
-    mobile   = res["mobile"]
-    email    = res["email"]
-    address  = res["address"]
-    pwd_hash = pbkdf2_sha256.hash(res["password"])
+    if not name or len(name) < 2:              return jsonify({"error":"full_name required"}), 400
+    if not MOBILE_IN_RE.match(mobile):         return jsonify({"error":"invalid mobile (India 10-digit)"}), 400
+    if len(password) < 8:                      return jsonify({"error":"password must be at least 8 chars"}), 400
+    if email and not EMAIL_RE.match(email):    return jsonify({"error":"invalid email"}), 400
+    if len(address) < 4:                       return jsonify({"error":"address required"}), 400
 
     code    = _otp()
-    expires = _ts(_utcnow() + timedelta(minutes=OTP_TTL_MIN))
+    expires = _now_ts() + OTP_TTL_MIN*60
+    pwd_hash = pbkdf2_sha256.hash(password)
 
     db = get_db()
     cur = db.cursor()
-
-    # If already verified, block duplicate registration
-    row = cur.execute("SELECT id, is_verified FROM users WHERE mobile=?", (mobile,)).fetchone()
+    row = cur.execute("SELECT id,is_verified FROM users WHERE mobile=?", (mobile,)).fetchone()
     if row and int(row["is_verified"]) == 1:
-        return jsonify({"error": "mobile already registered"}), 409
+        db.close()
+        return jsonify({"error":"mobile already registered"}), 409
 
-    # Upsert (SQLite ≥3.24): on mobile conflict, update the unverified user
+    # Upsert; keep user unverified until OTP verified
     cur.execute("""
-        INSERT INTO users (name, mobile, email, address, password_hash,
-                           verification_code, is_verified, created_at)
-        VALUES (?, ?, ?, ?, ?, ?, 0, CURRENT_TIMESTAMP)
+        INSERT INTO users (name,mobile,email,address,password_hash,verification_code,verify_expires,is_verified)
+        VALUES (?,?,?,?,?,?,?,0)
         ON CONFLICT(mobile) DO UPDATE SET
             name=excluded.name,
             email=excluded.email,
             address=excluded.address,
             password_hash=excluded.password_hash,
             verification_code=excluded.verification_code,
+            verify_expires=excluded.verify_expires,
             is_verified=0
-    """, (name, mobile, email, address, pwd_hash, code))
-    db.commit()
+    """, (name, mobile, email, address, pwd_hash, code, expires))
+    db.commit(); db.close()
 
     _send_code(mobile, code)
-    return jsonify({"message":"verification code sent",
-                    "mobile": mobile,
-                    "expires_in_min": OTP_TTL_MIN}), 201
+    return jsonify({"message":"verification code sent","mobile":mobile,"expires_in_min":OTP_TTL_MIN}), 201
 
 @auth_bp.post("/verify")
 @limiter.limit("20/hour")
 def verify():
-    """
-    JSON: { mobile, code }
-    Marks user as verified if OTP matches & not expired.
-    """
-    data   = request.get_json(silent=True) or {}
-    mobile = _clean(data.get("mobile"))
-    code   = _clean(data.get("code"))
+    d = request.get_json(silent=True) or {}
+    mobile = _clean(d.get("mobile"))
+    code   = _clean(d.get("code"))
 
-    if not MOBILE_RE.match(mobile):
-        return jsonify({"error":"invalid mobile"}), 400
-    if not code or not code.isdigit() or len(code) != 6:
-        return jsonify({"error":"invalid code"}), 400
+    if not MOBILE_IN_RE.match(mobile):             return jsonify({"error":"invalid mobile"}), 400
+    if not code.isdigit() or len(code) != 6:       return jsonify({"error":"invalid code"}), 400
 
     db = get_db()
-    cur = db.cursor()
-    row = cur.execute("""
-        SELECT id, verification_code, is_verified, created_at
-        FROM users WHERE mobile=?
-    """, (mobile,)).fetchone()
-
-    if not row:
-        return jsonify({"error":"user not found"}), 404
-    if int(row["is_verified"]) == 1:
-        return jsonify({"message":"already verified"}), 200
-
+    row = db.execute(
+        "SELECT id,verification_code,verify_expires,is_verified FROM users WHERE mobile=?",
+        (mobile,)
+    ).fetchone()
+    if not row:                       db.close(); return jsonify({"error":"user not found"}), 404
+    if int(row["is_verified"]) == 1:  db.close(); return jsonify({"message":"already verified"}), 200
     if (row["verification_code"] or "") != code:
-        return jsonify({"error":"incorrect code"}), 400
+        db.close(); return jsonify({"error":"incorrect code"}), 400
+    if row["verify_expires"] and _now_ts() > int(row["verify_expires"]):
+        db.close(); return jsonify({"error":"code expired"}), 400
 
-    # (Optional) If you add a verification_expires column later, check it here.
-
-    cur.execute("""
-        UPDATE users
-        SET is_verified=1, verification_code=NULL
-        WHERE id=?
-    """, (row["id"],))
-    db.commit()
+    db.execute("UPDATE users SET is_verified=1, verification_code=NULL, verify_expires=NULL WHERE id=?", (row["id"],))
+    db.commit(); db.close()
     return jsonify({"message":"verified"}), 200
 
-@auth_bp.route("/resend-code", methods=["POST"])
+@auth_bp.post("/resend-code")
 @limiter.limit("5/hour")
 def resend_code():
-    """
-    JSON: { mobile }
-    """
-    data = request.get_json(silent=True) or {}
-    mobile = _clean(data.get("mobile"))
-    if not MOBILE_RE.match(mobile):
-        return jsonify({"error":"invalid mobile"}), 400
+    d = request.get_json(silent=True) or {}
+    mobile = _clean(d.get("mobile"))
+    if not MOBILE_IN_RE.match(mobile): return jsonify({"error":"invalid mobile"}), 400
 
     db = get_db()
-    row = db.execute("SELECT id, verified FROM users WHERE mobile=?", (mobile,)).fetchone()
-    if not row:
-        return jsonify({"error":"not registered"}), 404
-    if row["verified"]:
-        return jsonify({"message":"already verified"}), 200
+    row = db.execute("SELECT id,is_verified FROM users WHERE mobile=?", (mobile,)).fetchone()
+    if not row:                       db.close(); return jsonify({"error":"not registered"}), 404
+    if int(row["is_verified"]) == 1:  db.close(); return jsonify({"message":"already verified"}), 200
 
     code = _otp()
-    expires = _ts(_utcnow() + timedelta(minutes=OTP_TTL_MIN))
-    db.execute("UPDATE users SET verify_code=?, verify_expires=? WHERE id=?",
-               (code, expires, row["id"]))
-    db.commit()
+    expires = _now_ts() + OTP_TTL_MIN*60
+    db.execute("UPDATE users SET verification_code=?, verify_expires=? WHERE id=?", (code, expires, row["id"]))
+    db.commit(); db.close()
     _send_code(mobile, code)
     return jsonify({"message":"verification code re-sent","expires_in_min":OTP_TTL_MIN}), 200
 
-
-@auth_bp.route("/login", methods=["POST"])
-@limiter.limit("20/hour")
+@auth_bp.post("/login")
+@limiter.limit("30/hour")
 def login():
-    """
-    JSON: { mobile, password }
-    Only verified users can login.
-    """
-    data = request.get_json(silent=True) or {}
-    mobile = _clean(data.get("mobile"))
-    password = data.get("password") or ""
-
-    if not MOBILE_RE.match(mobile) or not password:
+    d = request.get_json(silent=True) or {}
+    mobile = _clean(d.get("mobile"))
+    password = d.get("password") or ""
+    if not MOBILE_IN_RE.match(mobile) or not password:
         return jsonify({"error":"invalid credentials"}), 400
 
     db = get_db()
-    row = db.execute("""
-        SELECT id, password_hash, verified, full_name, email, address 
-        FROM users WHERE mobile=?
-    """, (mobile,)).fetchone()
-    if not row or not pbkdf2_sha256.verify(password, row["password_hash"]):
+    row = db.execute(
+        "SELECT id,is_banned,is_verified,password_hash,name,email,address FROM users WHERE mobile=?",
+        (mobile,)
+    ).fetchone()
+    db.close()
+    if not row:                       return jsonify({"error":"user not found"}), 404
+    if row["is_banned"]:              return jsonify({"error":"account banned"}), 403
+    if not row["is_verified"]:        return jsonify({"error":"not verified"}), 403
+    if not pbkdf2_sha256.verify(password, row["password_hash"]):
         return jsonify({"error":"invalid credentials"}), 401
-    if not row["verified"]:
-        return jsonify({"error":"account not verified"}), 403
 
-    access = make_access_token(row["id"], mobile)
-    refresh = make_refresh_token(row["id"])
     return jsonify({
-        "user":{
-            "id":row["id"],
-            "mobile":mobile,
-            "full_name":row["full_name"],
-            "email":row["email"],
-            "address":row["address"]
-        },
-        "access":access,
-        "refresh":refresh
+        "ok": True,
+        "user": {
+            "id": row["id"],
+            "name": row["name"],
+            "mobile": mobile,
+            "email": row["email"],
+            "address": row["address"],
+        }
     }), 200
 
-
-@auth_bp.route("/me", methods=["GET"])
-@auth_required
-def me():
-    db = get_db()
-    row = db.execute("""
-        SELECT id, mobile, full_name, email, address, created_at, verified 
-        FROM users WHERE id=?
-    """, (g.user_id,)).fetchone()
-    return jsonify({
-        "id":row["id"],
-        "mobile":row["mobile"],
-        "full_name":row["full_name"],
-        "email":row["email"],
-        "address":row["address"],
-        "created_at":row["created_at"],
-        "verified":bool(row["verified"])
-    }), 200
-# ===== /Registration + verification =========================================
-
-def ensure_user_columns():
-    conn = get_db()
-    cur = conn.cursor()
-    # base table
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS users(
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            name TEXT,
-            mobile TEXT UNIQUE,
-            email TEXT,
-            address TEXT,
-            password_hash TEXT,
-            verification_code TEXT,
-            is_verified INTEGER DEFAULT 0,
-            is_banned INTEGER DEFAULT 0,
-            balance REAL DEFAULT 0,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP                                                        )
-    """)
-    # add missing columns defensively
-    cur.execute("PRAGMA table_info(users)")
-    have = {row["name"] for row in cur.fetchall()}
-    wanted = {
-        "name":"TEXT",
-        "mobile":"TEXT",
-        "email":"TEXT",
-        "address":"TEXT",
-        "password_hash":"TEXT",
-        "verification_code":"TEXT",
-        "is_verified":"INTEGER DEFAULT 0",
-        "is_banned":"INTEGER DEFAULT 0",
-        "balance":"REAL DEFAULT 0",
-        "created_at":"TIMESTAMP DEFAULT CURRENT_TIMESTAMP",
-    }
-    for col, typ in wanted.items():
-        if col not in have:
-            cur.execute(f"ALTER TABLE users ADD COLUMN {col} {typ}")
-    conn.commit()
-    conn.close()
-
-@auth_bp.route("/refresh", methods=["POST"])
-def refresh():
-    """
-    JSON: { refresh }
-    Exchanges refresh -> new access (+ option to rotate refresh)
-    """
-    data = request.get_json(silent=True) or {}
-    token = data.get("refresh") or ""
-    payload = decode_token(token)
-    if not payload or payload.get("type") != "refresh":
-        return jsonify({"error": "invalid or expired refresh"}), 401
-
-    jti = payload.get("jti", "")
-    db = get_db()
-    rec = db.execute("SELECT user_id, revoked, expires_at FROM refresh_tokens WHERE jti=?", (jti,)).fetchone()
-    if not rec or rec["revoked"] or rec["expires_at"] < now_ts():
-        return jsonify({"error": "refresh revoked/expired"}), 401
-
-    user_id = rec["user_id"]
-    # optional rotation: revoke existing refresh and issue new one
-    db.execute("UPDATE refresh_tokens SET revoked=1 WHERE jti=?", (jti,))
-    db.commit()
-    # fetch mobile for claim
-    mobile = db.execute("SELECT mobile FROM users WHERE id=?", (user_id,)).fetchone()["mobile"]
-    access = make_access_token(user_id, mobile)
-    new_refresh = make_refresh_token(user_id)
-    return jsonify({"access": access, "refresh": new_refresh}), 200
-
-@auth_bp.route("/logout", methods=["POST"])
-def logout():
-    """
-    JSON: { refresh }
-    Revokes the refresh token (access naturally expires)
-    """
-    data = request.get_json(silent=True) or {}
-    token = data.get("refresh") or ""
-    payload = decode_token(token)
-    if not payload or payload.get("type") != "refresh":
-        return jsonify({"error": "invalid refresh"}), 400
-    jti = payload.get("jti", "")
-    db = get_db()
-    db.execute("UPDATE refresh_tokens SET revoked=1 WHERE jti=?", (jti,))
-    db.commit()
-    return jsonify({"message":"logged out"}), 200
-
-@auth_bp.route("/change-password", methods=["POST"])
-@auth_required
-def change_password():
-    """
-    Headers: Authorization: Bearer <access>
-    JSON: { old_password, new_password }
-    """
-    data = request.get_json(silent=True) or {}
-    old_pw = data.get("old_password") or ""
-    new_pw = data.get("new_password") or ""
-    if len(new_pw) < 8:
-        return jsonify({"error":"new password must be at least 8 chars"}), 400
-
-    db = get_db()
-    row = db.execute("SELECT password_hash FROM users WHERE id=?", (g.user_id,)).fetchone()
-    if not row or not pbkdf2_sha256.verify(old_pw, row["password_hash"]):
-        return jsonify({"error":"old password incorrect"}), 401
-
-    db.execute("UPDATE users SET password_hash=? WHERE id=?", (pbkdf2_sha256.hash(new_pw), g.user_id))
-    db.commit()
-    return jsonify({"message":"password updated"}), 200
-
-@auth_bp.route("/me", methods=["GET"])
-@auth_required
-def me():
-    db = get_db()
-    row = db.execute("SELECT id,mobile,created_at FROM users WHERE id=?", (g.user_id,)).fetchone()
-    return jsonify({"id":row["id"], "mobile":row["mobile"], "created_at":row["created_at"]}), 200
-
-# housekeeping: purge expired refresh tokens occasionally
-@app.before_request
-def _purge_refresh_tokens():
-    if secrets.randbelow(100) == 0:  # ~1% of requests
-        try:
-            clean_expired_refresh()
-        except Exception:
-            pass
-
-# Register the blueprint
+# register blueprint once
 app.register_blueprint(auth_bp)
-# ==== /Auth ==================================================================
 
 # ----------------------
 # GitHub helpers
