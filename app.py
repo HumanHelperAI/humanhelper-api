@@ -98,13 +98,86 @@ def ensure_auth_tables():
     conn.commit()
     conn.close()
 
+ # --- Wallet schema (ledger + safe holds) ---
+def ensure_wallet_tables():
+    conn = get_db()
+    cur = conn.cursor()
+
+    # Add locked_balance to users if missing (for 2-phase withdrawals)
+    cur.execute("PRAGMA table_info(users)")
+    have = {row["name"] for row in cur.fetchall()}
+    if "locked_balance" not in have:
+        cur.execute("ALTER TABLE users ADD COLUMN locked_balance REAL DEFAULT 0")
+
+    # Wallet ledger (immutable)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS wallet_txns (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            kind TEXT NOT NULL,                     -- 'deposit' | 'withdraw_lock' | 'withdraw_release' | 'withdraw_settle'
+            amount REAL NOT NULL,                   -- positive for credits, negative for debits
+            balance_after REAL NOT NULL,            -- user.balance after applying this txn (excludes locked)
+            locked_after REAL NOT NULL,             -- user.locked_balance after this txn
+            status TEXT NOT NULL,                   -- 'success' | 'requested' | 'rejected'
+            ref TEXT,                               -- external ref / UPI / txn id
+            note TEXT,
+            meta TEXT,                              -- JSON string if needed
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY(user_id) REFERENCES users(id)
+        )
+    """)
+
+    # A separate table to track withdrawal requests (admin flow)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS withdrawal_requests (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            amount REAL NOT NULL,
+            method TEXT,                            -- e.g., 'upi','bank'
+            account TEXT,                           -- e.g., upi id or masked bank
+            status TEXT NOT NULL DEFAULT 'requested',  -- requested | approved | rejected | paid
+            reason TEXT,                            -- reason for rejection
+            ref TEXT,                               -- payout reference if paid
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP
+        )
+    """)
+
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_wallet_user_time ON wallet_txns(user_id, created_at DESC)")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_withdraw_user_time ON withdrawal_requests(user_id, created_at DESC)")
+    conn.commit()
+    conn.close()
+
+# ----------------------
+# Flask app init
+# ----------------------
+
+from flask_limiter import Limiter
+from flask_limiter.util import get_remote_address
+
+app = Flask(__name__)
+
+# Use REDIS_URL if present, else fallback to in-memory (dev)
+RATE_LIMIT_STORAGE_URI = os.getenv("REDIS_URL") or os.getenv("RATE_LIMIT_REDIS_URI")
+
+limiter = Limiter(
+    key_func=get_remote_address,
+    app=app,
+    default_limits=["1000/day", "200/hour"],
+    storage_uri=RATE_LIMIT_STORAGE_URI,  # e.g. redis://default:<password>@<host>:<port>/0
+    strategy="fixed-window",             # or "moving-window"
+    headers_enabled=True                 # send X-RateLimit-* headers
+)
+
+# ----------------------
+# Fallback DB helpers (if `database` module not present)
+# ----------------------
 try:
     from database import init_db, run_query, cleanup_old_logs
 except Exception:
     print("[hh] Warning: database module not found — using SQLite helpers")
 
     def init_db():
-        # create users table if missing
         db = get_db()
         cur = db.cursor()
         cur.execute("""
@@ -135,6 +208,29 @@ except Exception:
     def cleanup_old_logs():
         # nothing to do for SQLite demo
         pass
+
+# ----------------------
+# Wallet helpers (module-level)
+# ----------------------
+def _user_by_id(uid: int):
+    db = get_db()
+    row = db.execute(
+        "SELECT id, balance, locked_balance, is_verified, is_banned FROM users WHERE id=?",
+        (uid,)
+    ).fetchone()
+    db.close()
+    return row
+
+def _insert_ledger(
+    db, user_id: int, kind: str, delta_amount: float,
+    balance_after: float, locked_after: float,
+    status: str, ref: str | None = None, note: str | None = None, meta: str | None = None
+):
+    db.execute("""
+        INSERT INTO wallet_txns (
+            user_id, kind, amount, balance_after, locked_after, status, ref, note, meta
+        ) VALUES (?,?,?,?,?,?,?,?,?)
+    """, (user_id, kind, delta_amount, balance_after, locked_after, status, ref, note, meta or None))
 
 try:
     from writer import start_writer, enqueue_write
@@ -175,6 +271,21 @@ OPENROUTER_URL = os.getenv("OPENROUTER_URL", "https://api.openrouter.ai/v1/chat/
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
 GEMINI_REST_URL = os.getenv("GEMINI_REST_URL", "")
 LLAMA_SERVER_URL = os.getenv("LLAMA_SERVER_URL", "http://127.0.0.1:5001/completion")
+
+# Wallet policy / limits
+WALLET_MIN_DEPOSIT = float(os.getenv("WALLET_MIN_DEPOSIT", "10"))
+WALLET_MAX_DEPOSIT = float(os.getenv("WALLET_MAX_DEPOSIT", "50000"))
+WALLET_MIN_WITHDRAW = float(os.getenv("WALLET_MIN_WITHDRAW", "100"))
+WALLET_MAX_WITHDRAW = float(os.getenv("WALLET_MAX_WITHDRAW", "100000"))
+WALLET_DAILY_DEPOSIT_CAP = float(os.getenv("WALLET_DAILY_DEPOSIT_CAP", "200000"))
+WALLET_DAILY_WITHDRAW_CAP = float(os.getenv("WALLET_DAILY_WITHDRAW_CAP", "200000"))
+
+def _amount_ok(x: Any) -> bool:
+    try:
+        v = float(x)
+        return v == v and abs(v) != float("inf")
+    except Exception:
+        return False
 
 # timeouts
 DEFAULT_REQ_TIMEOUT = int(os.getenv("DEFAULT_REQ_TIMEOUT", "12"))
@@ -575,18 +686,86 @@ def user_ban():
         return jsonify({"error": err or "ban failed", "wait_log": log, "eta": eta}), 400
     return jsonify({"message": f"user {mobile} banned ✅", "wait_log": log, "eta": eta}), 200
 
-# ... (other admin routes can be added similarly) ...
+@admin_bp.post("/withdraw/<int:wid>/approve")
+@limiter.limit("20/hour")
+@admin_required
+def admin_withdraw_approve(wid: int):
+    db = get_db()
+    cur = db.cursor()
+    req = cur.execute("SELECT id,user_id,amount,status FROM withdrawal_requests WHERE id=?", (wid,)).fetchone()
+    if not req:
+        db.close(); return jsonify({"error":"request not found"}), 404
+    if req["status"] not in ("requested","approved"):
+        db.close(); return jsonify({"error":"invalid state"}), 400
 
-# ----------------------
-# Flask app init
-# ----------------------
-app = Flask(__name__)
+    # Settle: deduct from locked -> (locked - amount), create ledger 'withdraw_settle'
+    user_id, amount = int(req["user_id"]), float(req["amount"])
+    cur.execute("""
+        UPDATE users
+        SET locked_balance = locked_balance - ?
+        WHERE id=? AND locked_balance >= ?
+    """, (amount, user_id, amount))
+    if cur.rowcount != 1:
+        db.rollback(); db.close()
+        return jsonify({"error":"locked funds not available"}), 409
+
+    # Mark request paid
+    cur.execute("""
+        UPDATE withdrawal_requests SET status='paid', updated_at=CURRENT_TIMESTAMP WHERE id=?
+    """, (wid,))
+
+    row = cur.execute("SELECT balance, locked_balance FROM users WHERE id=?", (user_id,)).fetchone()
+    _insert_ledger(db, user_id, "withdraw_settle", 0.0, float(row["balance"]), float(row["locked_balance"]),
+                   "success", ref=f"WREQ:{wid}", note="Withdrawal settled")
+    db.commit(); db.close()
+    return jsonify({"ok": True, "message":"withdrawal approved & settled"})
+
+@admin_bp.post("/withdraw/<int:wid>/reject")
+@limiter.limit("20/hour")
+@admin_required
+def admin_withdraw_reject(wid: int):
+    d = request.get_json(silent=True) or {}
+    reason = (d.get("reason") or "Rejected").strip()
+
+    db = get_db()
+    cur = db.cursor()
+    req = cur.execute("SELECT id,user_id,amount,status FROM withdrawal_requests WHERE id=?", (wid,)).fetchone()
+    if not req:
+        db.close(); return jsonify({"error":"request not found"}), 404
+    if req["status"] != "requested":
+        db.close(); return jsonify({"error":"only requested can be rejected"}), 400
+
+    user_id, amount = int(req["user_id"]), float(req["amount"])
+
+    # Release: move locked -> balance
+    cur.execute("""
+        UPDATE users
+        SET locked_balance = locked_balance - ?, balance = balance + ?
+        WHERE id=? AND locked_balance >= ?
+    """, (amount, amount, user_id, amount))
+    if cur.rowcount != 1:
+        db.rollback(); db.close()
+        return jsonify({"error":"locked funds not available"}), 409
+
+    cur.execute("""
+        UPDATE withdrawal_requests
+        SET status='rejected', reason=?, updated_at=CURRENT_TIMESTAMP
+        WHERE id=?
+    """, (reason, wid))
+
+    row = cur.execute("SELECT balance, locked_balance FROM users WHERE id=?", (user_id,)).fetchone()
+    _insert_ledger(db, user_id, "withdraw_release", +amount, float(row["balance"]), float(row["locked_balance"]),
+                   "rejected", ref=f"WREQ:{wid}", note=f"Withdrawal rejected: {reason}")
+    db.commit(); db.close()
+    return jsonify({"ok": True, "message":"withdrawal rejected & funds released"})
+
 
 # --- Initialize SQLite DB on startup ---
 try:
     init_db()
     ensure_user_columns()
     ensure_auth_tables()  # make sure refresh_tokens exists
+    ensure_wallet_tables()   # <-- add this if missing
     print("[hh] Database initialized ✅")
 except Exception as e:
     print("[hh] Database init warning:", e)
@@ -606,13 +785,6 @@ ALLOWED_ORIGINS = {
 # Use ONE CORS strategy. (A) Flask-Cors:
 from flask_cors import CORS
 CORS(app, resources={r"*": {"origins": ALLOWED_ORIGINS}}, supports_credentials=False)
-
-# If you prefer manual headers instead, keep add_cors_headers() below and delete the CORS(...) line.
-
-from flask_limiter import Limiter
-from flask_limiter.util import get_remote_address
-limiter = Limiter(get_remote_address, app=app, default_limits=["60 per minute"])
-# Example per-route: @limiter.limit("10/minute")
 
 # ----------------------
 # Auth Blueprint
@@ -1060,6 +1232,149 @@ def whoami():
 
 # register blueprint once
 app.register_blueprint(auth_bp)
+
+# =======================
+# Wallet blueprint + routes
+# =======================
+
+wallet_bp = Blueprint("wallet", __name__, url_prefix="/wallet")
+
+@wallet_bp.get("/balance")
+@limiter.limit("20/minute")
+@auth_required
+def wallet_balance():
+    db = get_db()
+    row = db.execute("SELECT balance, locked_balance FROM users WHERE id=?", (g.user_id,)).fetchone()
+    db.close()
+    if not row:
+        return jsonify({"error":"user not found"}), 404
+    return jsonify({
+        "ok": True,
+        "balance": round(float(row["balance"] or 0), 2),
+        "locked": round(float(row["locked_balance"] or 0), 2),
+        "available": round(float((row["balance"] or 0) - (row["locked_balance"] or 0)), 2)
+    })
+
+@wallet_bp.get("/history")
+@limiter.limit("30/minute")
+@auth_required
+def wallet_history():
+    limit = min(max(int(request.args.get("limit", 50)), 1), 200)
+    offset = max(int(request.args.get("offset", 0)), 0)
+    db = get_db()
+    rows = db.execute("""
+        SELECT id, kind, amount, balance_after, locked_after, status, ref, note, meta, created_at
+        FROM wallet_txns
+        WHERE user_id=?
+        ORDER BY id DESC
+        LIMIT ? OFFSET ?
+    """, (g.user_id, limit, offset)).fetchall()
+    db.close()
+    txns = []
+    for r in rows:
+        txns.append({
+            "id": r["id"], "kind": r["kind"], "amount": r["amount"],
+            "balance_after": r["balance_after"], "locked_after": r["locked_after"],
+            "status": r["status"], "ref": r["ref"], "note": r["note"], "meta": r["meta"],
+            "created_at": r["created_at"]
+        })
+    return jsonify({"ok": True, "txns": txns})
+
+@wallet_bp.post("/deposit")
+@limiter.limit("10/hour")
+@auth_required
+def wallet_deposit():
+    d = request.get_json(silent=True) or {}
+    amount = d.get("amount")
+    ref = (d.get("ref") or "").strip()        # e.g., gateway txn id
+    note = (d.get("note") or "").strip()
+
+    if not _amount_ok(amount): return jsonify({"error":"invalid amount"}), 400
+    amount = round(float(amount), 2)
+    if amount < WALLET_MIN_DEPOSIT or amount > WALLET_MAX_DEPOSIT:
+        return jsonify({"error": f"deposit must be between {WALLET_MIN_DEPOSIT} and {WALLET_MAX_DEPOSIT}"}), 400
+
+    # Daily deposit cap
+    db = get_db()
+    today = db.execute("SELECT date('now','localtime')").fetchone()[0]
+    sum_row = db.execute("""
+        SELECT COALESCE(SUM(amount),0) as s FROM wallet_txns
+        WHERE user_id=? AND kind='deposit' AND status='success' AND date(created_at)=?
+    """, (g.user_id, today)).fetchone()
+    today_sum = float(sum_row["s"] or 0)
+    if today_sum + amount > WALLET_DAILY_DEPOSIT_CAP:
+        db.close()
+        return jsonify({"error": "daily deposit limit reached"}), 429
+
+    # Credit atomically
+    cur = db.cursor()
+    cur.execute("UPDATE users SET balance = balance + ? WHERE id=? AND is_verified=1 AND is_banned=0",
+                (amount, g.user_id))
+    if cur.rowcount != 1:
+        db.close()
+        return jsonify({"error":"account not eligible"}), 403
+
+    # Read balances to record ledger
+    row = db.execute("SELECT balance, locked_balance FROM users WHERE id=?", (g.user_id,)).fetchone()
+    _insert_ledger(db, g.user_id, "deposit", +amount, float(row["balance"]), float(row["locked_balance"]), "success", ref=ref, note=note)
+    db.commit(); db.close()
+    return jsonify({"ok": True, "message":"deposit recorded", "balance": round(float(row["balance"]),2)}), 200
+
+@wallet_bp.post("/withdraw/request")
+@limiter.limit("5/hour")
+@auth_required
+def wallet_withdraw_request():
+    d = request.get_json(silent=True) or {}
+    amount = d.get("amount")
+    method = (d.get("method") or "upi").strip().lower()     # 'upi' | 'bank'
+    account = (d.get("account") or "").strip()              # upi id or masked bank
+
+    if not _amount_ok(amount): return jsonify({"error":"invalid amount"}), 400
+    amount = round(float(amount), 2)
+    if amount < WALLET_MIN_WITHDRAW or amount > WALLET_MAX_WITHDRAW:
+        return jsonify({"error": f"withdraw must be between {WALLET_MIN_WITHDRAW} and {WALLET_MAX_WITHDRAW}"}), 400
+
+    # Daily withdraw cap
+    db = get_db()
+    today = db.execute("SELECT date('now','localtime')").fetchone()[0]
+    sum_row = db.execute("""
+        SELECT COALESCE(SUM(amount),0) as s FROM withdrawal_requests
+        WHERE user_id=? AND date(created_at)=? AND status IN ('requested','approved','paid')
+    """, (g.user_id, today)).fetchone()
+    today_sum = float(sum_row["s"] or 0)
+    if today_sum + amount > WALLET_DAILY_WITHDRAW_CAP:
+        db.close()
+        return jsonify({"error":"daily withdraw limit reached"}), 429
+
+    # Lock funds: move amount from balance -> locked_balance atomically if available
+    cur = db.cursor()
+    cur.execute("""
+        UPDATE users
+        SET balance = balance - ?,
+            locked_balance = locked_balance + ?
+        WHERE id=? AND is_verified=1 AND is_banned=0 AND balance >= ?
+    """, (amount, amount, g.user_id, amount))
+    if cur.rowcount != 1:
+        db.close()
+        return jsonify({"error":"insufficient balance or not eligible"}), 400
+
+    # Record: withdrawal request + ledger lock
+    cur.execute("""
+        INSERT INTO withdrawal_requests (user_id, amount, method, account, status)
+        VALUES (?,?,?,?, 'requested')
+    """, (g.user_id, amount, method, account))
+    wid = cur.lastrowid
+
+    row = db.execute("SELECT balance, locked_balance FROM users WHERE id=?", (g.user_id,)).fetchone()
+    _insert_ledger(db, g.user_id, "withdraw_lock", -amount, float(row["balance"]), float(row["locked_balance"]),
+                   "requested", ref=f"WREQ:{wid}", note=f"Withdraw requested via {method}: {account}")
+    db.commit(); db.close()
+
+    return jsonify({"ok": True, "request_id": wid, "message":"withdrawal requested & funds locked",
+                    "balance": round(float(row["balance"]),2),
+                    "locked": round(float(row["locked_balance"]),2)}), 200
+
+app.register_blueprint(wallet_bp)   # ✅ Wallet routes
 
 # ----------------------
 # GitHub helpers
