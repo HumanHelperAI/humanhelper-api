@@ -34,6 +34,7 @@ yt-dlp==2025.9.5
 
 # --- Background file watching / auto-reload (optional, dev use) ---
 watchgod==0.8.2
+redis>=4.5.0
 
 # --- HTTP & Parsing ---
 certifi==2025.8.3
