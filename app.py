@@ -18,6 +18,7 @@ import re, json, logging
 from werkzeug.exceptions import HTTPException
 from passlib.hash import pbkdf2_sha256
 
+
 # --- SQLite helper for Termux/mobile ---
 import sqlite3
 DB_PATH = os.getenv("DATABASE_URL", "db.sqlite3")
@@ -98,79 +99,101 @@ def ensure_auth_tables():
     conn.commit()
     conn.close()
 
- # --- Wallet schema (ledger + safe holds) ---
+# --- Wallet schema (single pooled fee) ---
 def ensure_wallet_tables():
-    conn = get_db()
-    cur = conn.cursor()
+    conn = get_db(); cur = conn.cursor()
 
-    # Add locked_balance to users if missing (for 2-phase withdrawals)
+    # users.locked_balance if missing
     cur.execute("PRAGMA table_info(users)")
-    have = {row["name"] for row in cur.fetchall()}
+    have = {r["name"] for r in cur.fetchall()}
     if "locked_balance" not in have:
         cur.execute("ALTER TABLE users ADD COLUMN locked_balance REAL DEFAULT 0")
 
-    # Wallet ledger (immutable)
+    # immutable ledger
     cur.execute("""
-        CREATE TABLE IF NOT EXISTS wallet_txns (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER NOT NULL,
-            kind TEXT NOT NULL,                     -- 'deposit' | 'withdraw_lock' | 'withdraw_release' | 'withdraw_settle'
-            amount REAL NOT NULL,                   -- positive for credits, negative for debits
-            balance_after REAL NOT NULL,            -- user.balance after applying this txn (excludes locked)
-            locked_after REAL NOT NULL,             -- user.locked_balance after this txn
-            status TEXT NOT NULL,                   -- 'success' | 'requested' | 'rejected'
-            ref TEXT,                               -- external ref / UPI / txn id
-            note TEXT,
-            meta TEXT,                              -- JSON string if needed
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            FOREIGN KEY(user_id) REFERENCES users(id)
-        )
-    """)
+    CREATE TABLE IF NOT EXISTS wallet_txns (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER NOT NULL,
+        kind TEXT NOT NULL,        -- deposit|earn|withdraw_lock|withdraw_settle|withdraw_release|fee_pool|p2p_out|p2p_in
+        amount REAL NOT NULL,      -- +credit/-debit from user's perspective
+        balance_after REAL NOT NULL,
+        locked_after REAL NOT NULL,
+        status TEXT NOT NULL,      -- requested|success|failed|rejected
+        ref TEXT,
+        note TEXT,
+        meta TEXT,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY(user_id) REFERENCES users(id)
+    )""")
 
-    # A separate table to track withdrawal requests (admin flow)
+    # withdrawal requests
     cur.execute("""
-        CREATE TABLE IF NOT EXISTS withdrawal_requests (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER NOT NULL,
-            amount REAL NOT NULL,
-            method TEXT,                            -- e.g., 'upi','bank'
-            account TEXT,                           -- e.g., upi id or masked bank
-            status TEXT NOT NULL DEFAULT 'requested',  -- requested | approved | rejected | paid
-            reason TEXT,                            -- reason for rejection
-            ref TEXT,                               -- payout reference if paid
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            updated_at TIMESTAMP
-        )
-    """)
+    CREATE TABLE IF NOT EXISTS withdrawal_requests(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER NOT NULL,
+        amount REAL NOT NULL,       -- gross amount user requested
+        net_amount REAL NOT NULL,   -- amount paid to user after fee
+        fee_amount REAL NOT NULL,   -- total 8% fee (goes to pool)
+        upi TEXT,
+        payout_id TEXT,
+        status TEXT NOT NULL DEFAULT 'requested',  -- requested|processing|paid|failed
+        reason TEXT,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP,
+        FOREIGN KEY(user_id) REFERENCES users(id)
+    )""")
 
-    cur.execute("CREATE INDEX IF NOT EXISTS idx_wallet_user_time ON wallet_txns(user_id, created_at DESC)")
-    cur.execute("CREATE INDEX IF NOT EXISTS idx_withdraw_user_time ON withdrawal_requests(user_id, created_at DESC)")
-    conn.commit()
-    conn.close()
+    # single pooled fee bucket
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS fee_pool (
+        id INTEGER PRIMARY KEY CHECK (id=1),
+        pool_balance REAL NOT NULL DEFAULT 0,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )""")
+    cur.execute("INSERT OR IGNORE INTO fee_pool (id,pool_balance) VALUES (1,0)")
 
-# ----------------------
+    conn.commit(); conn.close()
+
+
+# ----------------------                                                              
 # Flask app init
 # ----------------------
-
 from flask_limiter import Limiter
 from flask_limiter.util import get_remote_address
+from flask_limiter.errors import RateLimitExceeded
 
 app = Flask(__name__)
+
+app.url_map.strict_slashes = False
 
 # Use REDIS_URL if present, else fallback to in-memory (dev)
 RATE_LIMIT_STORAGE_URI = os.getenv("REDIS_URL") or os.getenv("RATE_LIMIT_REDIS_URI")
 
+def rate_key():
+    """
+    Per-user limits when authenticated, otherwise per-IP.
+    """
+    if getattr(g, "user_id", None):
+        return f"user:{g.user_id}"
+    return get_remote_address()
+
 limiter = Limiter(
-    key_func=get_remote_address,
+    key_func=rate_key,
     app=app,
     default_limits=["1000/day", "200/hour"],
-    storage_uri=RATE_LIMIT_STORAGE_URI,  # e.g. redis://default:<password>@<host>:<port>/0
-    strategy="fixed-window",             # or "moving-window"
-    headers_enabled=True                 # send X-RateLimit-* headers
+    storage_uri=RATE_LIMIT_STORAGE_URI,   # e.g. redis://default:<password>@<host>:<port>/0
+    strategy="fixed-window",
+    headers_enabled=True
 )
 
+@app.errorhandler(RateLimitExceeded)
+def ratelimit_handler(e):
+    return jsonify({"ok": False, "error": {"code":"rate_limited","message":"Too many requests. Try later."}}), 429
+
+
+
 # ----------------------
-# Fallback DB helpers (if `database` module not present)
+# Fallback DB helpers (if `database` module not present)                                                                          
 # ----------------------
 try:
     from database import init_db, run_query, cleanup_old_logs
@@ -205,12 +228,273 @@ except Exception:
         db.close()
         return rows
 
-    def cleanup_old_logs():
+MIN_WITHDRAW = 100.0          # ₹100
+FEE_RATE = 0.08               # 8%
+FEE_SPLIT = (0.5, 0.5)        # 50/50 => charity, maintenance
+
+def _fetch_user(uid: int):
+    db = get_db()
+    row = db.execute("SELECT id,balance,locked_balance,is_verified,is_banned FROM users WHERE id=?", (uid,)).fetchone()
+    db.close()
+    return row
+
+def _insert_ledger(
+    db, user_id: int, kind: str, delta_amount: float,
+    balance_after: float, locked_after: float,
+    status: str, ref: str | None = None, note: str | None = None, meta: dict | None = None
+):
+    db.execute("""
+        INSERT INTO wallet_txns (
+            user_id, kind, amount, balance_after, locked_after, status, ref, note, meta
+        ) VALUES (?,?,?,?,?,?,?,?,?)
+    """, (user_id, kind, delta_amount, balance_after, locked_after, status, ref, note,
+          json.dumps(meta) if meta is not None else None))
+
+def _calc_fee(amount: float) -> tuple[float,float,float]:
+    """Returns (fee_total, fee_charity, fee_maint)."""
+    fee = round(amount * FEE_RATE, 2)
+    ch = round(fee * FEE_SPLIT[0], 2)
+    mt = round(fee - ch, 2)
+    return fee, ch, mt
+
+def _upi_validate(s: str) -> bool:
+    s = (s or "").strip()
+    # simple UPI validation: letters/digits/.-_ + @ + handle
+    return bool(re.match(r"^[a-zA-Z0-9.\-_]{2,}@[a-zA-Z]{2,}$", s))
+
+def _qr_payload_for_user(user_id: int) -> str:
+    # You can display this string as QR on frontend; payer scans & posts to /wallet/transfer with receiver_id
+    return f"hhpay:user:{user_id}"
+
+def cleanup_old_logs():
         # nothing to do for SQLite demo
         pass
 
+
+
+# =========================                                                                                                      
+# ADMIN BLUEPRINT + ROUTES
+# =========================
+
+admin_bp = Blueprint("admin", __name__, url_prefix="/admin")
+
+def admin_required(fn):
+    @wraps(fn)
+    def _wrap(*a, **k):
+        token = request.headers.get("X-Admin-Token", "")
+        if not token or token != os.getenv("ADMIN_TOKEN", "changeme"):
+            return jsonify({"ok": False, "error": {"code": "forbidden", "message": "admin auth failed"}}), 403
+        return fn(*a, **k)
+    return _wrap
+
+
+# ----- Fee pool (read-only dashboard) -----
+@admin_bp.get("/wallet/fees")
+@admin_required
+def admin_fees_read():
+    db = get_db()
+    row = db.execute("SELECT charity_balance, maintenance_balance, updated_at FROM fee_pool WHERE id=1").fetchone()
+    db.close()
+    if not row:
+        return jsonify({"ok": False, "error": {"code": "not_found", "message": "fee pool not initialized"}}), 404
+    return jsonify({
+        "ok": True,
+        "charity": float(row["charity_balance"]),
+        "maintenance": float(row["maintenance_balance"]),
+        "updated_at": row["updated_at"]
+    })
+
+
+# ----- Fee pool transfer (optional) -----
+# Use this to periodically clear fee_pool into your accounting system.
+@admin_bp.post("/wallet/fees/transfer")
+@admin_required
+def admin_fees_transfer():
+    d = request.get_json(silent=True) or {}
+    from_pool = (d.get("from") or "").strip().lower()          # "charity" or "maintenance"
+    amount = float(d.get("amount") or 0)
+    note = (d.get("note") or "").strip()
+
+    if from_pool not in ("charity", "maintenance"):
+        return jsonify({"ok": False, "error": {"code": "bad_request", "message": "from must be charity|maintenance"}}), 400
+    if amount <= 0:
+        return jsonify({"ok": False, "error": {"code": "bad_request", "message": "amount must be > 0"}}), 400
+
+    col = "charity_balance" if from_pool == "charity" else "maintenance_balance"
+    db = get_db(); cur = db.cursor()
+    try:
+        db.execute("BEGIN IMMEDIATE")
+        r = cur.execute(f"SELECT {col} FROM fee_pool WHERE id=1").fetchone()
+        if not r or float(r[0]) < amount:
+            raise ValueError("insufficient pool balance")
+        # reduce pool
+        cur.execute(f"UPDATE fee_pool SET {col} = {col} - ?, updated_at=CURRENT_TIMESTAMP WHERE id=1", (amount,))
+        # audit it into a synthetic admin ledger row (user_id=0)
+        cur.execute("""
+            INSERT INTO wallet_txns (user_id, kind, amount, balance_after, locked_after, status, ref, note, meta)
+            VALUES (0, ?, ?, 0, 0, 'success', ?, ?, ?)
+        """, (f"fee_transfer_{from_pool}", -amount, f"FEEPOOL:{from_pool}", note, json.dumps({"by": "admin"})))
+        db.commit()
+    except Exception as e:
+        db.rollback(); db.close()
+        return jsonify({"ok": False, "error": {"code": "failed", "message": str(e)}}), 400
+    db.close()
+    return jsonify({"ok": True, "message": f"transferred {amount} from {from_pool} pool"})
+
+
+# ----- List users (search) -----
+@admin_bp.get("/users")
+@admin_required
+def admin_users_list():
+    q = (request.args.get("q") or "").strip()
+    limit = min(max(int(request.args.get("limit", 50)), 1), 200)
+    offset = max(int(request.args.get("offset", 0)), 0)
+
+    params, sql = [], "SELECT id,name,mobile,email,balance,is_banned,is_verified,created_at FROM users"
+    if q:
+        sql += " WHERE name LIKE ? OR mobile LIKE ? OR email LIKE ?"
+        like = f"%{q}%"; params.extend([like, like, like])
+    sql += " ORDER BY id DESC LIMIT ? OFFSET ?"
+    params.extend([limit, offset])
+
+    rows = run_query(sql, tuple(params), fetch=True) or []
+    users = []
+    for r in rows:
+        # sqlite Row or tuple support
+        id_, name, mobile, email, bal, banned, verified, created = r
+        users.append({
+            "id": id_,
+            "name": name,
+            "mobile": mobile,
+            "email": email,
+            "balance": float(bal or 0),
+            "is_banned": bool(banned),
+            "is_verified": bool(verified),
+            "created_at": created,
+        })
+    return jsonify({"ok": True, "users": users})
+
+
+# ----- Ban / Unban user -----
+@admin_bp.post("/user/ban")
+@admin_required
+def admin_user_ban():
+    d = request.get_json(silent=True) or {}
+    mobile = (d.get("mobile") or "").strip()
+    if not mobile:
+        return jsonify({"ok": False, "error": {"code": "bad_request", "message": "mobile required"}}), 400
+    db = get_db(); cur = db.cursor()
+    cur.execute("UPDATE users SET is_banned=1 WHERE mobile=?", (mobile,))
+    db.commit(); db.close()
+    return jsonify({"ok": True, "message": f"user {mobile} banned"})
+
+@admin_bp.post("/user/unban")
+@admin_required
+def admin_user_unban():
+    d = request.get_json(silent=True) or {}
+    mobile = (d.get("mobile") or "").strip()
+    if not mobile:
+        return jsonify({"ok": False, "error": {"code": "bad_request", "message": "mobile required"}}), 400
+    db = get_db(); cur = db.cursor()
+    cur.execute("UPDATE users SET is_banned=0 WHERE mobile=?", (mobile,))
+    db.commit(); db.close()
+    return jsonify({"ok": True, "message": f"user {mobile} unbanned"})
+
+
+# ----- User transactions (inspect) -----
+@admin_bp.get("/user/<int:uid>/txns")
+@admin_required
+def admin_user_txns(uid: int):
+    limit = min(max(int(request.args.get("limit", 50)), 1), 200)
+    offset = max(int(request.args.get("offset", 0)), 0)
+    db = get_db()
+    rows = db.execute("""
+        SELECT id,kind,amount,status,ref,note,meta,created_at,balance_after,locked_after
+        FROM wallet_txns WHERE user_id=? ORDER BY id DESC LIMIT ? OFFSET ?
+    """, (uid, limit, offset)).fetchall()
+    db.close()
+    txns = []
+    for r in rows:
+        txns.append({
+            "id": r["id"],
+            "kind": r["kind"],
+            "amount": float(r["amount"]),
+            "status": r["status"],
+            "ref": r["ref"],
+            "note": r["note"],
+            "meta": json.loads(r["meta"]) if r["meta"] else None,
+            "balance_after": float(r["balance_after"]),
+            "locked_after": float(r["locked_after"]),
+            "created_at": r["created_at"],
+        })
+    return jsonify({"ok": True, "transactions": txns})
+
+
+# ----- Withdrawals list (monitor only; payouts are automatic) -----
+@admin_bp.get("/withdrawals")
+@admin_required
+def admin_withdrawals_list():
+    status = (request.args.get("status") or "").strip().lower()  # requested|processing|paid|failed (optional)
+    limit = min(max(int(request.args.get("limit", 50)), 1), 200)
+    offset = max(int(request.args.get("offset", 0)), 0)
+
+    params = []
+    sql = """
+      SELECT id, user_id, amount, net_amount, fee_amount, upi, payout_id, status, reason, created_at, updated_at
+      FROM withdrawal_requests
+    """
+    if status:
+        sql += " WHERE status=?"
+        params.append(status)
+    sql += " ORDER BY id DESC LIMIT ? OFFSET ?"
+    params.extend([limit, offset])
+
+    db = get_db()
+    rows = db.execute(sql, tuple(params)).fetchall()
+    db.close()
+    out = []
+    for r in rows:
+        out.append({
+            "id": r["id"],
+            "user_id": r["user_id"],
+            "amount": float(r["amount"]),
+            "net_amount": float(r["net_amount"]),
+            "fee_amount": float(r["fee_amount"]),
+            "upi": r["upi"],
+            "payout_id": r["payout_id"],
+            "status": r["status"],
+            "reason": r["reason"],
+            "created_at": r["created_at"],
+            "updated_at": r["updated_at"],
+        })
+    return jsonify({"ok": True, "withdrawals": out})
+
+
+# ----- (Optional) credit/debit adjust (for testing only) -----
+@admin_bp.post("/user/adjust")
+@admin_required
+def admin_adjust_balance():
+    d = request.get_json()
+    user_id = d.get("user_id")
+    delta = float(d.get("delta", 0))
+    note = d.get("note", "admin adjustment")
+
+    db = get_db()
+    cur = db.cursor()
+    cur.execute("UPDATE users SET balance = balance + ? WHERE id=?", (delta, user_id))
+    db.commit()
+    db.close()
+
+    return jsonify({"ok": True, "message": f"Adjusted ₹{delta} for user {user_id}", "note": note})
+
+# ✅ Register admin blueprint once (AFTER all routes above are defined)
+app.register_blueprint(admin_bp)
+
+
+
+
 # ----------------------
-# Wallet helpers (module-level)
+# Wallet helpers (module-level)                                                                                                   
 # ----------------------
 def _user_by_id(uid: int):
     db = get_db()
@@ -220,17 +504,6 @@ def _user_by_id(uid: int):
     ).fetchone()
     db.close()
     return row
-
-def _insert_ledger(
-    db, user_id: int, kind: str, delta_amount: float,
-    balance_after: float, locked_after: float,
-    status: str, ref: str | None = None, note: str | None = None, meta: str | None = None
-):
-    db.execute("""
-        INSERT INTO wallet_txns (
-            user_id, kind, amount, balance_after, locked_after, status, ref, note, meta
-        ) VALUES (?,?,?,?,?,?,?,?,?)
-    """, (user_id, kind, delta_amount, balance_after, locked_after, status, ref, note, meta or None))
 
 try:
     from writer import start_writer, enqueue_write
@@ -258,7 +531,47 @@ except Exception:
         return False, "earnings not configured"
     print("[hh] Warning: earnings module not found — using stubs")
 
-# ----------------------
+# -------- Razorpay Payout (UPI only) --------
+uyRAZORPAY_KEY_ID = os.getenv("RAZORPAY_KEY_ID", "")
+RAZORPAY_KEY_SECRET = os.getenv("RAZORPAY_KEY_SECRET", "")
+RAZORPAY_PAYOUT_URL = "https://api.razorpay.com/v1/payouts"
+
+def _razorpay_payout_upi(upi_id: str, amount_inr: float, ref: str, timeout: int = 12) -> tuple[bool, dict | str]:
+    if not (RAZORPAY_KEY_ID and RAZORPAY_KEY_SECRET):
+        return False, "razorpay not configured"
+
+    # amount in paise
+    amt = int(round(amount_inr * 100))
+    payload = {
+        "account_number": os.getenv("RAZORPAY_VPA_SOURCE_ACC", ""),  # Your virtual account/RAZORPAY account no
+        "fund_account": {
+            "account_type": "vpa",
+            "vpa": {"address": upi_id},
+            "contact": {"name": "HH User", "type": "employee"}  # Razorpay requires a contact; VPA payouts allow inline
+        },
+        "amount": amt,
+        "currency": "INR",
+        "mode": "UPI",
+        "purpose": "payout",
+        "queue_if_low_balance": True,
+        "reference_id": ref,
+        "narration": "HumanHelper Withdrawal"
+    }
+    try:
+        r = requests.post(
+            RAZORPAY_PAYOUT_URL,
+            auth=(RAZORPAY_KEY_ID, RAZORPAY_KEY_SECRET),
+            json=payload, timeout=timeout
+        )
+        if r.status_code >= 400:
+            return False, f"razorpay {r.status_code}: {(r.text or '')[:500]}"
+        return True, r.json()
+    except Exception as e:
+        return False, str(e)
+
+
+
+# ----------------------                                                                                                          
 # Config / env
 # ----------------------
 ADMIN_TOKEN = os.getenv("ADMIN_TOKEN", "changeme")
@@ -387,8 +700,10 @@ def clean_expired_refresh():
     conn.close()
 # ==== /JWT ====================================================================
 
+
+
 # ----------------------
-# Utilities: HTTP with retries/backoff
+# Utilities: HTTP with retries/backoff                                                                                            
 # ----------------------
 def _do_request_with_retries(method: str, url: str, headers: Optional[dict] = None, json_body: Optional[dict] = None,
                              timeout: int = 10, max_attempts: int = 3) -> Tuple[bool, Any]:
@@ -424,11 +739,50 @@ def _do_request_with_retries(method: str, url: str, headers: Optional[dict] = No
             attempt += 1
     return False, f"request failed after {max_attempts} attempts: {last_exc}"
 
-# ----------------------
+
+
+# ----------------------                                                                                                          
 # Provider wrappers
 # ----------------------
+def enforce_length(prompt: str, target_words: int | None) -> str:
+    if not target_words:
+        return prompt
+    return (
+        f"{prompt}\n\n"
+        f"Write **about {target_words} words**. "
+        f"Plain paragraph, no lists, no markdown, no code blocks."
+    )
 
-# OpenRouter wrapper (OpenRouter uses a chat-completions style)
+def _extract_text_like(j: dict) -> str:
+    # 1) OpenAI-like
+    try:
+        ch = j.get("choices", [])
+        if ch:
+            first = ch[0]
+            # message.content
+            msg = (first.get("message") or {})
+            txt = msg.get("content")
+            if isinstance(txt, str) and txt.strip():
+                return txt.strip()
+            # some providers use "text" directly
+            txt = first.get("text")
+            if isinstance(txt, str) and txt.strip():
+                return txt.strip()
+            # some use "content" as list of parts -> [{"type":"text","text":"..."}]
+            content = first.get("content")
+            if isinstance(content, list) and content:
+                for part in content:
+                    if isinstance(part, dict) and isinstance(part.get("text"), str) and part["text"].strip():
+                        return part["text"].strip()
+    except Exception:
+        pass
+    # 2) top-level fallbacks
+    for k in ("text", "output", "content", "response"):
+        v = j.get(k)
+        if isinstance(v, str) and v.strip():
+            return v.strip()
+    return ""
+
 def ask_openrouter(model: str, prompt: str, timeout: int = OPENROUTER_TIMEOUT) -> Tuple[bool, str]:
     if not OPENROUTER_API_KEY or not OPENROUTER_URL:
         return False, "openrouter not configured"
@@ -436,7 +790,7 @@ def ask_openrouter(model: str, prompt: str, timeout: int = OPENROUTER_TIMEOUT) -
     payload = {
         "model": model,
         "messages": [{"role": "user", "content": prompt}],
-        "max_tokens": 512,
+        "max_tokens": 384,
         "temperature": 0.3
     }
     ok, resp = _do_request_with_retries("post", OPENROUTER_URL, headers=headers, json_body=payload, timeout=timeout)
@@ -446,50 +800,50 @@ def ask_openrouter(model: str, prompt: str, timeout: int = OPENROUTER_TIMEOUT) -
         return False, str(resp)
     try:
         j = resp.json()
-        # OpenRouter may return choices similar to OpenAI
-        if isinstance(j, dict):
-            if "choices" in j and j["choices"]:
-                first = j["choices"][0]
-                # message style
-                if isinstance(first, dict):
-                    txt = first.get("message", {}).get("content") or first.get("text") or first.get("output") or ""
-                    return True, (txt or "").strip()
-            # sometimes the provider returns direct fields
-            for k in ("text", "output", "content", "response"):
-                if k in j and isinstance(j[k], str):
-                    return True, j[k].strip()
-        return True, (resp.text or "")[:2000]
+        text = _extract_text_like(j)
+        if not text:
+            # one quick retry with a tiny instruction to force plain text
+            payload2 = dict(payload)
+            payload2["messages"] = [{"role":"user","content": f"{prompt}\n\nRespond with plain text only."}]
+            r2 = requests.post(OPENROUTER_URL, headers=headers, json=payload2, timeout=timeout)
+            if r2.status_code == 200:
+                text = _extract_text_like(r2.json())
+        return True, (text or "").strip()
     except Exception as e:
         return False, f"openrouter parse error: {e}"
 
 # OpenAI REST (generic)
-def ask_openai_rest(prompt: str, timeout: int = OPENAI_TIMEOUT) -> Tuple[bool, str]:
-    key = OPENAI_API_KEY
-    if not key:
-        return False, "openai not configured"
-    headers = {"Authorization": f"Bearer {key}", "Content-Type": "application/json"}
-    body = {
-        "model": os.getenv("OPENAI_MODEL", "gpt-3.5-turbo"),
-        "messages": [{"role":"user","content": prompt}],
-        "max_tokens": int(os.getenv("OPENAI_MAX_TOKENS","400")),
-        "temperature": float(os.getenv("OPENAI_TEMPERATURE","0.3"))
+def ask_openai_rest(prompt: str, timeout: int = OPENAI_TIMEOUT) -> Tuple[bool, str]:  
+    key = OPENAI_API_KEY  
+    if not key:  
+        return False, "openai not configured"  
+
+    headers = {"Authorization": f"Bearer {key}", "Content-Type": "application/json"}  
+    body = {  
+        "model": os.getenv("OPENAI_MODEL", "gpt-4o-mini"),  
+        "messages": [{"role": "user", "content": prompt}],  
+        "max_tokens": int(os.getenv("OPENAI_MAX_TOKENS", "400")),  
+        "temperature": float(os.getenv("OPENAI_TEMPERATURE", "0.3"))  
     }
+
+    # ✅ Make sure this line is indented **4 spaces** under the function
     ok, resp = _do_request_with_retries("post", OPENAI_URL, headers=headers, json_body=body, timeout=timeout)
-    if not ok:
-        if isinstance(resp, requests.Response):
-            return False, f"OpenAI error {resp.status_code}: {resp.text[:800]}"
-        return False, str(resp)
-    try:
-        j = resp.json()
-        choices = j.get("choices", [])
-        if choices:
-            text = choices[0].get("message", {}).get("content") or choices[0].get("text")
-            return True, (text or "").strip()
-        # fallback shapes
-        if "error" in j:
-            return False, json.dumps(j["error"])[:800]
-        return True, json.dumps(j)[:1000]
-    except Exception as e:
+
+    if not ok:  
+        if isinstance(resp, requests.Response):  
+            return False, f"OpenAI error {resp.status_code}: {resp.text[:800]}"  
+        return False, str(resp)  
+
+    try:  
+        j = resp.json()  
+        choices = j.get("choices", [])  
+        if choices:  
+            text = choices[0].get("message", {}).get("content") or choices[0].get("text")  
+            return True, (text or "").strip()  
+        if "error" in j:  
+            return False, json.dumps(j["error"])[:800]  
+        return True, json.dumps(j)[:1000]  
+    except Exception as e:  
         return False, f"OpenAI parse error: {e}"
 
 # DeepSeek wrapper
@@ -524,30 +878,22 @@ def ask_deepseek(prompt: str, timeout: int = DEEPSEEK_TIMEOUT) -> Tuple[bool, st
         return False, f"DeepSeek parse error: {e}"
 
 # Gemini-free wrapper (REST)
-def gemini_free_chat(prompt: str, timeout: int = GEMINI_TIMEOUT) -> Tuple[bool,str]:
-    if GEMINI_REST_URL and GEMINI_API_KEY:
-        headers = {"Authorization": f"Bearer {GEMINI_API_KEY}", "Content-Type": "application/json"}
-        payload = {"prompt": prompt, "max_tokens": int(os.getenv("GEMINI_MAX_TOKENS","400"))}
-        ok, resp = _do_request_with_retries("post", GEMINI_REST_URL, headers=headers, json_body=payload, timeout=timeout)
-        if not ok:
-            if isinstance(resp, requests.Response):
-                return False, f"Gemini-free error {resp.status_code}: {resp.text[:800]}"
-            return False, str(resp)
-        try:
-            j = resp.json()
-            for k in ("content","text","answer","response"):
-                if k in j and isinstance(j[k], str):
-                    return True, j[k].strip()
-            if "choices" in j and isinstance(j["choices"], list) and j["choices"]:
-                first = j["choices"][0]
-                for k in ("text","content","message"):
-                    if k in first and isinstance(first[k], str):
-                        return True, first[k].strip()
-            return True, json.dumps(j)[:1000]
-        except Exception as e:
-            return False, f"Gemini-free parse error: {e}"
-    return False, "Gemini-free not configured"
-
+def gemini_free_chat(prompt: str, timeout: int = 12) -> tuple[bool,str]:
+    api_key = os.getenv("GEMINI_API_KEY")
+    base = os.getenv("GEMINI_REST_URL","https://generativelanguage.googleapis.com/v1beta")
+    if not api_key: 
+        return False, "gemini not configured"
+    url = f"{base}/models/gemini-2.0-flash:generateContent?key={api_key}"
+    body = {"contents":[{"parts":[{"text":prompt}]}]}
+    try:
+        r = requests.post(url, json=body, timeout=timeout)
+        if r.status_code != 200:
+            return False, f"gemini http {r.status_code}: {r.text[:400]}"
+        j = r.json()
+        text = j["candidates"][0]["content"]["parts"][0]["text"]
+        return True, text.strip()
+    except Exception as e:
+        return False, f"gemini error: {e}"
 # LLaMA local server wrapper (assumes simple JSON API)
 def ask_llama(prompt: str, n_predict: int = 256, timeout: int = LLAMA_TIMEOUT) -> Tuple[bool,str]:
     url = LLAMA_SERVER_URL
@@ -578,186 +924,66 @@ def ask_llama(prompt: str, n_predict: int = 256, timeout: int = LLAMA_TIMEOUT) -
     except Exception:
         return True, (r.text or "").strip() or ""
 
+# ---------- Clean FREE_MODELS_PRIORITY parsing ----------
+def _split_priority(s: str) -> list[str]:
+    # handles stray quotes/whitespace/newlines/commas
+    tokens = []
+    for raw in (s or "").replace("\n", ",").split(","):
+        t = raw.strip().strip('"').strip("'")
+        if t:
+            tokens.append(t)
+    return tokens
+
+FREE_MODELS_PRIORITY = _split_priority(os.getenv("FREE_MODELS_PRIORITY", ""))
+
+if not FREE_MODELS_PRIORITY:
+    FREE_MODELS_PRIORITY = [
+        "openai:gpt-4o-mini",
+        "gemini:gemini-2.0-flash",   # matches REST name in your gemini_free_chat()
+        "openrouter:gpt-oss-20b",
+    ]
+
+
+
 # ----------------------
-# Model selection helper: try free providers in the configured order
-# FREE_MODELS_PRIORITY format: "<provider>:<model>" e.g. "openrouter:gpt-oss-20b"
-# Provider keys we support: openrouter, deepseek, openai, gemini, llama (llama handled separately)
+# FREE_MODELS_PRIORITY format: "<provider>:<model>" e.g. "openrouter:gpt-oss-20b"                                                 
 # ----------------------
 def try_free_models_in_order(prompt: str, timeout_each: int = OPENROUTER_TIMEOUT) -> Tuple[bool, str, Optional[str]]:
-    """
-    Returns (ok, answer, provider_name) where provider_name is descriptive.
-    """
     last_errs = []
     for token in FREE_MODELS_PRIORITY:
-        if ":" in token:
-            prov, model = token.split(":",1)
-            prov = prov.strip().lower()
-            model = model.strip()
-        else:
-            # if only provider given, choose a default model name
-            prov = token.strip().lower()
-            model = ""
+        prov, model = (token.split(":", 1) + [""])[:2]
+        prov, model = prov.strip().lower(), model.strip()
+
         try:
-            if prov in ("openrouter", "openrouter.ai", "openrouter_api"):
-                if not OPENROUTER_API_KEY:
-                    last_errs.append("openrouter not configured")
-                    continue
-                ok, res = ask_openrouter(model or "gpt-oss-20b", prompt, timeout=timeout_each)
-                if ok: return True, res, f"openrouter/{model or 'default'}"
-                last_errs.append(f"openrouter:{res}")
-            elif prov in ("deepseek", "deepseek.com"):
-                if not DEEPSEEK_API_KEY:
-                    last_errs.append("deepseek not configured")
-                    continue
-                ok, res = ask_deepseek(prompt, timeout=timeout_each)
-                if ok: return True, res, "deepseek"
-                last_errs.append(f"deepseek:{res}")
-            elif prov in ("openai", "openai.com", "gpt"):
-                if not OPENAI_API_KEY:
-                    last_errs.append("openai not configured")
-                    continue
+            if prov in ("openai", "gpt"):
                 ok, res = ask_openai_rest(prompt, timeout=timeout_each)
-                if ok: return True, res, "openai"
+                if ok: return True, res, f"openai/{model or 'default'}"
                 last_errs.append(f"openai:{res}")
-            elif prov.startswith("google") or prov.startswith("gemini"):
+
+            elif prov in ("gemini", "google"):
                 ok, res = gemini_free_chat(prompt, timeout=timeout_each)
                 if ok: return True, res, "gemini-free"
                 last_errs.append(f"gemini:{res}")
-            elif prov in ("nous", "nousresearch", "nousresearch/deephermes"):
-                # try via openrouter or deepseek if configured - handled above if token explicitly specified
-                last_errs.append("nous: not directly supported; try via openrouter if available")
+
+            elif prov in ("openrouter", "openrouter.ai"):
+                if not model: model = "openrouter/auto"
+                ok, res = ask_openrouter(model, prompt, timeout=timeout_each)
+                if ok: return True, res, f"openrouter/{model}"
+                last_errs.append(f"openrouter:{res}")
+
+            elif prov == "llama":
+                ok, res = ask_llama(prompt, timeout=timeout_each)
+                if ok: return True, res, "llama"
+                last_errs.append(f"llama:{res}")
+
             else:
                 last_errs.append(f"{prov}:unknown provider")
         except Exception as e:
-            last_errs.append(str(e))
-    # none responded
+            last_errs.append(f"{prov}:{e}")
+
     return False, "; ".join(last_errs[:5]) or "no free provider configured", None
 
-# ----------------------
-# Admin blueprint + helpers
-# ----------------------
-admin_bp = Blueprint("admin", __name__, url_prefix="/admin")
 
-def admin_required(fn):
-    @wraps(fn)
-    def wrapper(*args, **kwargs):
-        token = request.headers.get("X-Admin-Token", "") or ""
-        if token != ADMIN_TOKEN and token != os.getenv("ADMIN_TOKEN", ADMIN_TOKEN):
-            return jsonify({"error":"admin auth failed"}), 403
-        return fn(*args, **kwargs)
-    return wrapper
-
-def _audit(action, actor, target, details):
-    ip = request.headers.get("X-Forwarded-For") or request.remote_addr or "-"
-    try:
-        enqueue_write("INSERT INTO audit_log (action, actor, target, details, ip) VALUES (?,?,?,?,?)",
-                      (action, actor, target, details, ip), timeout=3.0)
-    except Exception:
-        pass
-
-@admin_bp.get("/users")
-@admin_required
-def list_users():
-    q = (request.args.get("q") or "").strip()
-    limit = int(request.args.get("limit", 50))
-    offset = int(request.args.get("offset", 0))
-    params, sql = [], "SELECT id,name,mobile,aadhar,pan,balance,is_banned FROM users"
-    if q:
-        sql += " WHERE name LIKE ? OR mobile LIKE ? OR pan LIKE ?"
-        like = f"%{q}%"
-        params.extend([like, like, like])
-    sql += " ORDER BY id DESC LIMIT ? OFFSET ?"
-    params.extend([limit, offset])
-    rows = run_query(sql, tuple(params), fetch=True)
-    users = [{"id": r[0], "name": r[1], "mobile": r[2], "aadhar": r[3],
-              "pan": r[4], "balance": r[5], "is_banned": bool(r[6])} for r in rows]
-    return jsonify({"users": users})
-
-@admin_bp.post("/user/ban")
-@admin_required
-def user_ban():
-    data = request.json or {}
-    mobile, reason = data.get("mobile"), data.get("reason","")
-    if not mobile:
-        return jsonify({"error":"mobile required"}), 400
-    ok, _, log, eta, err = enqueue_write("UPDATE users SET is_banned=1 WHERE mobile=?", (mobile,), timeout=10.0)
-    _audit("user_ban", "admin", mobile, reason)
-    if not ok:
-        return jsonify({"error": err or "ban failed", "wait_log": log, "eta": eta}), 400
-    return jsonify({"message": f"user {mobile} banned ✅", "wait_log": log, "eta": eta}), 200
-
-@admin_bp.post("/withdraw/<int:wid>/approve")
-@limiter.limit("20/hour")
-@admin_required
-def admin_withdraw_approve(wid: int):
-    db = get_db()
-    cur = db.cursor()
-    req = cur.execute("SELECT id,user_id,amount,status FROM withdrawal_requests WHERE id=?", (wid,)).fetchone()
-    if not req:
-        db.close(); return jsonify({"error":"request not found"}), 404
-    if req["status"] not in ("requested","approved"):
-        db.close(); return jsonify({"error":"invalid state"}), 400
-
-    # Settle: deduct from locked -> (locked - amount), create ledger 'withdraw_settle'
-    user_id, amount = int(req["user_id"]), float(req["amount"])
-    cur.execute("""
-        UPDATE users
-        SET locked_balance = locked_balance - ?
-        WHERE id=? AND locked_balance >= ?
-    """, (amount, user_id, amount))
-    if cur.rowcount != 1:
-        db.rollback(); db.close()
-        return jsonify({"error":"locked funds not available"}), 409
-
-    # Mark request paid
-    cur.execute("""
-        UPDATE withdrawal_requests SET status='paid', updated_at=CURRENT_TIMESTAMP WHERE id=?
-    """, (wid,))
-
-    row = cur.execute("SELECT balance, locked_balance FROM users WHERE id=?", (user_id,)).fetchone()
-    _insert_ledger(db, user_id, "withdraw_settle", 0.0, float(row["balance"]), float(row["locked_balance"]),
-                   "success", ref=f"WREQ:{wid}", note="Withdrawal settled")
-    db.commit(); db.close()
-    return jsonify({"ok": True, "message":"withdrawal approved & settled"})
-
-@admin_bp.post("/withdraw/<int:wid>/reject")
-@limiter.limit("20/hour")
-@admin_required
-def admin_withdraw_reject(wid: int):
-    d = request.get_json(silent=True) or {}
-    reason = (d.get("reason") or "Rejected").strip()
-
-    db = get_db()
-    cur = db.cursor()
-    req = cur.execute("SELECT id,user_id,amount,status FROM withdrawal_requests WHERE id=?", (wid,)).fetchone()
-    if not req:
-        db.close(); return jsonify({"error":"request not found"}), 404
-    if req["status"] != "requested":
-        db.close(); return jsonify({"error":"only requested can be rejected"}), 400
-
-    user_id, amount = int(req["user_id"]), float(req["amount"])
-
-    # Release: move locked -> balance
-    cur.execute("""
-        UPDATE users
-        SET locked_balance = locked_balance - ?, balance = balance + ?
-        WHERE id=? AND locked_balance >= ?
-    """, (amount, amount, user_id, amount))
-    if cur.rowcount != 1:
-        db.rollback(); db.close()
-        return jsonify({"error":"locked funds not available"}), 409
-
-    cur.execute("""
-        UPDATE withdrawal_requests
-        SET status='rejected', reason=?, updated_at=CURRENT_TIMESTAMP
-        WHERE id=?
-    """, (reason, wid))
-
-    row = cur.execute("SELECT balance, locked_balance FROM users WHERE id=?", (user_id,)).fetchone()
-    _insert_ledger(db, user_id, "withdraw_release", +amount, float(row["balance"]), float(row["locked_balance"]),
-                   "rejected", ref=f"WREQ:{wid}", note=f"Withdrawal rejected: {reason}")
-    db.commit(); db.close()
-    return jsonify({"ok": True, "message":"withdrawal rejected & funds released"})
 
 
 # --- Initialize SQLite DB on startup ---
@@ -786,7 +1012,11 @@ ALLOWED_ORIGINS = {
 from flask_cors import CORS
 CORS(app, resources={r"*": {"origins": ALLOWED_ORIGINS}}, supports_credentials=False)
 
-# ----------------------
+
+
+
+
+# ----------------------                                                                                                          
 # Auth Blueprint
 # ----------------------
 auth_bp = Blueprint("auth", __name__, url_prefix="/auth")
@@ -841,12 +1071,6 @@ def validate_mobile(m: str) -> bool:
 def options_any(anypath):
     return ("", 204)
 
-# register admin blueprint
-try:
-    app.register_blueprint(admin_bp)
-except Exception as e:
-    print("[hh] admin blueprint register failed:", e)
-
 # light background cleanup thread (non-blocking)
 def _cleanup_loop():
     while True:
@@ -863,8 +1087,23 @@ def _cleanup_loop():
 
 threading.Thread(target=_cleanup_loop, daemon=True).start()
 
+# --- Admin guard ---
+def admin_required(fn):
+    @wraps(fn)
+    def _wrap(*a, **k):
+        tok = (request.headers.get("X-Admin-Token") or "").strip()
+        if not ADMIN_TOKEN:
+            return jsonify({"error":"admin not configured"}), 500
+        if tok != ADMIN_TOKEN:
+            # tiny debug line you can keep or remove later
+            app.logger.warning("admin_required: bad token len=%s", len(tok))
+            return jsonify({"error":"admin auth failed"}), 401
+        return fn(*a, **k)
+    return _wrap
+
+
 # ----------------------
-# Simple utility endpoints
+# Simple utility endpoints                                                                                                       
 # ----------------------
 @app.route("/", methods=["GET"])
 def root():
@@ -903,128 +1142,119 @@ def debug_whichdb():
         info["error"] = str(e)
     return jsonify(info)
 
-# ----------------------
-# AI endpoints: ai/ask (simple), ai/humanhelper (routing with free-first + premium fallback)
-# ----------------------
-def is_premium_user(req) -> bool:
-    try:
-        j = req.get_json(silent=True) or {}
-        if isinstance(j.get("premium"), bool):
-            return j.get("premium")
-    except Exception:
-        pass
-    h = (req.headers.get("X-Premium") or "").strip().lower()
-    if h in ("1", "true", "yes", "on"):
-        return True
-    admin_token = req.headers.get("X-Admin-Token", "")
-    if admin_token and admin_token == ADMIN_TOKEN:
-        return True
-    return False
 
+
+# ----------------------
+# AI endpoints: ai/ask (simple), ai/humanhelper (routing with free-first + premium fallback)                                      
+# ----------------------
 @app.route("/ai/ask", methods=["POST"])
 def ai_ask():
     """
-    Lightweight single-call AI endpoint (tries free-first configured providers).
-    This is best-effort and will return first working provider's answer.
+    Lightweight single-call AI endpoint (tries FREE_MODELS_PRIORITY in order).
     """
     data = request.get_json(force=False) or {}
     prompt = (data.get("prompt") or "").strip()
     if not prompt:
-        return jsonify({"error":"prompt required"}), 400
+        return jsonify({"ok": False, "error": "prompt required"}), 400
 
-    # Try free models in order (OpenRouter / DeepSeek / OpenAI if listed)
     ok, ans_or_err, provider = try_free_models_in_order(prompt, timeout_each=10)
     if ok:
         return jsonify({"ok": True, "provider": provider or "free", "answer": ans_or_err}), 200
 
-    # Fallback: if premium and OpenAI configured, try OpenAI
-    if is_premium_user(request) and OPENAI_API_KEY:
-        ok2, res2 = ask_openai_rest(prompt, timeout=OPENAI_TIMEOUT)
-        if ok2:
-            return jsonify({"ok": True, "provider":"openai", "answer": res2}), 200
-        else:
-            return jsonify({"ok": False, "provider":"openai", "error": res2}), 502
+    # Premium users get a deterministic paid-first pass: OpenAI -> Gemini -> OpenRouter -> LLaMA
+    if is_premium_user(request):
+        # 1) OpenAI
+        if OPENAI_API_KEY:
+            ok1, res1 = ask_openai_rest(prompt, timeout=OPENAI_TIMEOUT)
+            if ok1: return jsonify({"ok": True, "provider": "openai", "answer": res1}), 200
 
-    # Try DeepSeek as a last attempt
-    if DEEPSEEK_API_KEY:
-        ok3, res3 = ask_deepseek(prompt, timeout=DEEPSEEK_TIMEOUT)
-        if ok3:
-            return jsonify({"ok": True, "provider":"deepseek", "answer": res3}), 200
-        else:
-            return jsonify({"ok": False, "provider":"deepseek", "error": res3}), 502
+        # 2) Gemini
+        ok2, res2 = gemini_free_chat(prompt, timeout=GEMINI_TIMEOUT)
+        if ok2: return jsonify({"ok": True, "provider": "gemini", "answer": res2}), 200
 
-    return jsonify({"ok": False, "provider":"none", "answer": ans_or_err}), 502
+        # 3) OpenRouter
+        if OPENROUTER_API_KEY:
+            # try first openrouter-* token in priority list if present
+            for token in FREE_MODELS_PRIORITY:
+                if token.startswith("openrouter"):
+                    model = token.split(":", 1)[1] if ":" in token else "gpt-oss-20b"
+                    ok3, res3 = ask_openrouter(model, prompt, timeout=OPENROUTER_TIMEOUT)
+                    if ok3: 
+                        return jsonify({"ok": True, "provider": f"openrouter/{model}", "answer": res3}), 200
+                    break
+
+        # 4) LLaMA
+        ok4, res4 = ask_llama(prompt, timeout=LLAMA_TIMEOUT)
+        if ok4: return jsonify({"ok": True, "provider": "llama", "answer": res4}), 200
+
+    return jsonify({"ok": False, "provider": "none", "error": ans_or_err}), 502
+
 
 @app.route("/ai/humanhelper", methods=["POST"])
 def ai_humanhelper():
     """
-    Rich routing: non-premium tries free models only (no paid OpenAI),
-    premium tries paid providers first (OpenAI -> DeepSeek -> LLaMA).
+    Rich routing with conversation history support in the future.
+    For now, mirrors ai/ask logic but keeps premium paid-first path.
     """
     data = request.get_json(force=False) or {}
     prompt = (data.get("prompt") or "").strip()
-    history = data.get("history", None)
     if not prompt:
-        return jsonify({"error":"prompt required"}), 400
+        return jsonify({"ok": False, "error": "prompt required"}), 400
 
     premium = is_premium_user(request)
 
-    # Non-premium: try free models first (OpenRouter/DeepSeek)
     if not premium:
         ok, ans, prov = try_free_models_in_order(prompt, timeout_each=10)
         if ok:
-            return jsonify({"provider": prov or "free", "ok": True, "answer": ans}), 200
-        # LLaMA fallback (local) if configured
+            return jsonify({"ok": True, "provider": prov or "free", "answer": ans}), 200
         llama_ok, llama_ans = ask_llama(prompt, timeout=LLAMA_TIMEOUT)
         if llama_ok:
-            return jsonify({"provider":"llama","ok":True,"answer":llama_ans}), 200
-        return jsonify({"provider":"none","ok":False,"answer": ans}), 502
+            return jsonify({"ok": True, "provider": "llama", "answer": llama_ans}), 200
+        return jsonify({"ok": False, "provider": "none", "error": ans}), 502
 
-    # Premium path:
-    # 1) OpenAI if configured
+    # premium path: OpenAI -> Gemini -> OpenRouter -> LLaMA
     if OPENAI_API_KEY:
         ok_oa, ans_oa = ask_openai_rest(prompt, timeout=OPENAI_TIMEOUT)
         if ok_oa:
-            return jsonify({"provider":"openai","ok":True,"answer":ans_oa}), 200
+            return jsonify({"ok": True, "provider": "openai", "answer": ans_oa}), 200
 
-    # 2) DeepSeek if configured
-    if DEEPSEEK_API_KEY:
-        ok_ds, ans_ds = ask_deepseek(prompt, timeout=DEEPSEEK_TIMEOUT)
-        if ok_ds:
-            return jsonify({"provider":"deepseek","ok":True,"answer":ans_ds}), 200
+    ok_g, ans_g = gemini_free_chat(prompt, timeout=GEMINI_TIMEOUT)
+    if ok_g:
+        return jsonify({"ok": True, "provider": "gemini", "answer": ans_g}), 200
 
-    # 3) OpenRouter as paid fallback if configured
-    for tok in FREE_MODELS_PRIORITY:
-        if tok.startswith("openrouter"):
-            # attempt with default model if not specified
-            model = tok.split(":",1)[1] if ":" in tok else "gpt-oss-20b"
-            ok_or, res_or = ask_openrouter(model, prompt, timeout=OPENROUTER_TIMEOUT)
-            if ok_or:
-                return jsonify({"provider": f"openrouter/{model}", "ok": True, "answer": res_or}), 200
+    if OPENROUTER_API_KEY:
+        for tok in FREE_MODELS_PRIORITY:
+            if tok.startswith("openrouter"):
+                model = tok.split(":",1)[1] if ":" in tok else "gpt-oss-20b"
+                ok_or, res_or = ask_openrouter(model, prompt, timeout=OPENROUTER_TIMEOUT)
+                if ok_or:
+                    return jsonify({"ok": True, "provider": f"openrouter/{model}", "answer": res_or}), 200
+                break
 
-    # 4) LLaMA fallback
     llama_ok, llama_ans = ask_llama(prompt, timeout=LLAMA_TIMEOUT)
     if llama_ok:
-        return jsonify({"provider":"llama","ok":True,"answer":llama_ans}), 200
+        return jsonify({"ok": True, "provider": "llama", "answer": llama_ans}), 200
 
-    return jsonify({"provider":"none","ok":False,"answer":"All providers failed. Please try again later."}), 502
+    return jsonify({"ok": False, "provider": "none", "error": "All providers failed."}), 502
+
 
 @app.route("/ai/status", methods=["GET"])
 def ai_status():
     return jsonify({
         "openai_configured": bool(OPENAI_API_KEY),
-        "openrouter_configured": bool(OPENROUTER_API_KEY),
-        "deepseek_configured": bool(DEEPSEEK_API_KEY),
         "gemini_configured": bool(GEMINI_REST_URL and GEMINI_API_KEY),
+        "openrouter_configured": bool(OPENROUTER_API_KEY),
         "llama_server": LLAMA_SERVER_URL,
         "free_models_priority": FREE_MODELS_PRIORITY,
         "notes": {
-            "free_first": "Tries free providers in FREE_MODELS_PRIORITY order (OpenRouter/DeepSeek/OpenAI/Gemini...).",
-            "premium_flow": "OpenAI -> DeepSeek -> OpenRouter -> LLaMA fallback."
+            "free_first": "Tries providers exactly in FREE_MODELS_PRIORITY order.",
+            "premium_flow": "OpenAI -> Gemini -> OpenRouter -> LLaMA."
         }
     })
 
-# =======================
+
+
+# =======================                                                                                                       
 # Auth blueprint + routes
 # =======================
 
@@ -1233,11 +1463,26 @@ def whoami():
 # register blueprint once
 app.register_blueprint(auth_bp)
 
-# =======================
-# Wallet blueprint + routes
-# =======================
+
+
+# =========================                                                                                                      
+# WALLET BLUEPRINT + ROUTES
+# =========================
 
 wallet_bp = Blueprint("wallet", __name__, url_prefix="/wallet")
+
+MIN_WITHDRAW = 100.0          # ₹100
+FEE_RATE     = 0.08           # 8% total -> goes to ONE pool
+
+def _upi_validate(s: str) -> bool:
+    s = (s or "").strip()
+    return bool(re.match(r"^[a-zA-Z0-9.\-_]{2,}@[a-zA-Z]{2,}$", s))
+
+def _qr_payload_for_user(user_id: int) -> str:
+    return f"hhpay:user:{user_id}"
+
+def _calc_fee(amount: float) -> float:
+    return round(amount * FEE_RATE, 2)
 
 @wallet_bp.get("/balance")
 @limiter.limit("20/minute")
@@ -1247,18 +1492,21 @@ def wallet_balance():
     row = db.execute("SELECT balance, locked_balance FROM users WHERE id=?", (g.user_id,)).fetchone()
     db.close()
     if not row:
-        return jsonify({"error":"user not found"}), 404
-    return jsonify({
-        "ok": True,
-        "balance": round(float(row["balance"] or 0), 2),
-        "locked": round(float(row["locked_balance"] or 0), 2),
-        "available": round(float((row["balance"] or 0) - (row["locked_balance"] or 0)), 2)
-    })
+        return err("user not found", 404)
+    bal = float(row["balance"] or 0)
+    locked = float(row["locked_balance"] or 0)
+    return ok({"balance": round(bal,2), "locked": round(locked,2), "available": round(bal-locked,2)})
 
-@wallet_bp.get("/history")
+@wallet_bp.get("/me/qr")
 @limiter.limit("30/minute")
 @auth_required
-def wallet_history():
+def wallet_my_qr():
+    return ok({"qr_payload": _qr_payload_for_user(g.user_id)})
+
+@wallet_bp.get("/transactions")
+@limiter.limit("30/minute")
+@auth_required
+def wallet_transactions():
     limit = min(max(int(request.args.get("limit", 50)), 1), 200)
     offset = max(int(request.args.get("offset", 0)), 0)
     db = get_db()
@@ -1273,110 +1521,183 @@ def wallet_history():
     txns = []
     for r in rows:
         txns.append({
-            "id": r["id"], "kind": r["kind"], "amount": r["amount"],
-            "balance_after": r["balance_after"], "locked_after": r["locked_after"],
-            "status": r["status"], "ref": r["ref"], "note": r["note"], "meta": r["meta"],
-            "created_at": r["created_at"]
+            "id": r["id"],
+            "kind": r["kind"],
+            "amount": float(r["amount"]),
+            "balance_after": float(r["balance_after"]),
+            "locked_after": float(r["locked_after"]),
+            "status": r["status"],
+            "ref": r["ref"],
+            "note": r["note"],
+            "meta": json.loads(r["meta"]) if r["meta"] else None,
+            "created_at": r["created_at"],
         })
-    return jsonify({"ok": True, "txns": txns})
+    return ok({"txns": txns})
 
-@wallet_bp.post("/deposit")
-@limiter.limit("10/hour")
+@wallet_bp.post("/transfer")
+@limiter.limit("20/minute")
 @auth_required
-def wallet_deposit():
+def wallet_transfer():
     d = request.get_json(silent=True) or {}
-    amount = d.get("amount")
-    ref = (d.get("ref") or "").strip()        # e.g., gateway txn id
-    note = (d.get("note") or "").strip()
+    amount = float(d.get("amount") or 0)
+    receiver_id = d.get("receiver_id")
+    qr = (d.get("qr_payload") or "").strip()
 
-    if not _amount_ok(amount): return jsonify({"error":"invalid amount"}), 400
-    amount = round(float(amount), 2)
-    if amount < WALLET_MIN_DEPOSIT or amount > WALLET_MAX_DEPOSIT:
-        return jsonify({"error": f"deposit must be between {WALLET_MIN_DEPOSIT} and {WALLET_MAX_DEPOSIT}"}), 400
+    if amount <= 0:
+        return err("amount must be > 0", 400)
+    if not receiver_id and qr:
+        m = re.match(r"^hhpay:user:(\d+)$", qr)
+        if not m:
+            return err("invalid qr payload", 400)
+        receiver_id = int(m.group(1))
+    try:
+        receiver_id = int(receiver_id)
+    except Exception:
+        return err("receiver_id required", 400)
+    if receiver_id == g.user_id:
+        return err("cannot transfer to self", 400)
 
-    # Daily deposit cap
-    db = get_db()
-    today = db.execute("SELECT date('now','localtime')").fetchone()[0]
-    sum_row = db.execute("""
-        SELECT COALESCE(SUM(amount),0) as s FROM wallet_txns
-        WHERE user_id=? AND kind='deposit' AND status='success' AND date(created_at)=?
-    """, (g.user_id, today)).fetchone()
-    today_sum = float(sum_row["s"] or 0)
-    if today_sum + amount > WALLET_DAILY_DEPOSIT_CAP:
-        db.close()
-        return jsonify({"error": "daily deposit limit reached"}), 429
+    db = get_db(); cur = db.cursor()
+    try:
+        db.execute("BEGIN IMMEDIATE")
+        s = cur.execute("SELECT balance FROM users WHERE id=?", (g.user_id,)).fetchone()
+        if not s: raise ValueError("sender not found")
+        if float(s["balance"]) < amount: raise ValueError("insufficient balance")
+        if not cur.execute("SELECT 1 FROM users WHERE id=?", (receiver_id,)).fetchone():
+            raise ValueError("receiver not found")
 
-    # Credit atomically
-    cur = db.cursor()
-    cur.execute("UPDATE users SET balance = balance + ? WHERE id=? AND is_verified=1 AND is_banned=0",
-                (amount, g.user_id))
-    if cur.rowcount != 1:
-        db.close()
-        return jsonify({"error":"account not eligible"}), 403
+        cur.execute("UPDATE users SET balance = balance - ? WHERE id=?", (amount, g.user_id))
+        r1 = cur.execute("SELECT balance, locked_balance FROM users WHERE id=?", (g.user_id,)).fetchone()
+        cur.execute("""INSERT INTO wallet_txns
+            (user_id,kind,amount,balance_after,locked_after,status,ref,note,meta)
+            VALUES (?,?,?,?,?,'success',NULL,?,NULL)
+        """, (g.user_id, "p2p_out", -amount, r1["balance"], r1["locked_balance"], f"to user:{receiver_id}"))
 
-    # Read balances to record ledger
-    row = db.execute("SELECT balance, locked_balance FROM users WHERE id=?", (g.user_id,)).fetchone()
-    _insert_ledger(db, g.user_id, "deposit", +amount, float(row["balance"]), float(row["locked_balance"]), "success", ref=ref, note=note)
-    db.commit(); db.close()
-    return jsonify({"ok": True, "message":"deposit recorded", "balance": round(float(row["balance"]),2)}), 200
+        cur.execute("UPDATE users SET balance = balance + ? WHERE id=?", (amount, receiver_id))
+        r2 = cur.execute("SELECT balance, locked_balance FROM users WHERE id=?", (receiver_id,)).fetchone()
+        cur.execute("""INSERT INTO wallet_txns
+            (user_id,kind,amount,balance_after,locked_after,status,ref,note,meta)
+            VALUES (?,?,?,?,?,'success',NULL,?,NULL)
+        """, (receiver_id, "p2p_in", amount, r2["balance"], r2["locked_balance"], f"from user:{g.user_id}"))
 
-@wallet_bp.post("/withdraw/request")
+        db.commit()
+    except Exception as e:
+        db.rollback(); db.close()
+        return err(str(e), 400)
+    db.close()
+    return ok({"message":"transfer complete"})
+
+@wallet_bp.post("/withdraw")
 @limiter.limit("5/hour")
 @auth_required
-def wallet_withdraw_request():
+def wallet_withdraw():
     d = request.get_json(silent=True) or {}
-    amount = d.get("amount")
-    method = (d.get("method") or "upi").strip().lower()     # 'upi' | 'bank'
-    account = (d.get("account") or "").strip()              # upi id or masked bank
+    amount = float(d.get("amount") or 0)
+    upi_id = (d.get("upi_id") or "").strip()
 
-    if not _amount_ok(amount): return jsonify({"error":"invalid amount"}), 400
-    amount = round(float(amount), 2)
-    if amount < WALLET_MIN_WITHDRAW or amount > WALLET_MAX_WITHDRAW:
-        return jsonify({"error": f"withdraw must be between {WALLET_MIN_WITHDRAW} and {WALLET_MAX_WITHDRAW}"}), 400
+    if amount < MIN_WITHDRAW:
+        return err(f"minimum withdrawal is ₹{int(MIN_WITHDRAW)}", 400)
+    if not _upi_validate(upi_id):
+        return err("invalid UPI id", 400)
 
-    # Daily withdraw cap
-    db = get_db()
-    today = db.execute("SELECT date('now','localtime')").fetchone()[0]
-    sum_row = db.execute("""
-        SELECT COALESCE(SUM(amount),0) as s FROM withdrawal_requests
-        WHERE user_id=? AND date(created_at)=? AND status IN ('requested','approved','paid')
-    """, (g.user_id, today)).fetchone()
-    today_sum = float(sum_row["s"] or 0)
-    if today_sum + amount > WALLET_DAILY_WITHDRAW_CAP:
-        db.close()
-        return jsonify({"error":"daily withdraw limit reached"}), 429
+    fee_total = _calc_fee(amount)
+    net = round(amount - fee_total, 2)
+    if net <= 0:
+        return err("amount too low after fees", 400)
 
-    # Lock funds: move amount from balance -> locked_balance atomically if available
-    cur = db.cursor()
-    cur.execute("""
-        UPDATE users
-        SET balance = balance - ?,
-            locked_balance = locked_balance + ?
-        WHERE id=? AND is_verified=1 AND is_banned=0 AND balance >= ?
-    """, (amount, amount, g.user_id, amount))
-    if cur.rowcount != 1:
-        db.close()
-        return jsonify({"error":"insufficient balance or not eligible"}), 400
+    db = get_db(); cur = db.cursor()
+    wreq_id = None; payout_id = None
+    try:
+        db.execute("BEGIN IMMEDIATE")
+        r = cur.execute("SELECT balance FROM users WHERE id=?", (g.user_id,)).fetchone()
+        if not r or float(r["balance"]) < amount:
+            raise ValueError("insufficient balance")
 
-    # Record: withdrawal request + ledger lock
-    cur.execute("""
-        INSERT INTO withdrawal_requests (user_id, amount, method, account, status)
-        VALUES (?,?,?,?, 'requested')
-    """, (g.user_id, amount, method, account))
-    wid = cur.lastrowid
+        # move to locked
+        cur.execute("""
+            UPDATE users
+            SET balance = balance - ?, locked_balance = locked_balance + ?
+            WHERE id=?""", (amount, amount, g.user_id))
+        rlock = cur.execute("SELECT balance, locked_balance FROM users WHERE id=?", (g.user_id,)).fetchone()
+        cur.execute("""INSERT INTO wallet_txns
+            (user_id,kind,amount,balance_after,locked_after,status,ref,note,meta)
+            VALUES (?,?,?,?,?,'requested',?, ?, ?)
+        """, (g.user_id, "withdraw_lock", -amount, rlock["balance"], rlock["locked_balance"],
+              None, f"lock for withdraw {amount}",
+              json.dumps({"upi": upi_id, "net": net, "fee": fee_total})))
 
-    row = db.execute("SELECT balance, locked_balance FROM users WHERE id=?", (g.user_id,)).fetchone()
-    _insert_ledger(db, g.user_id, "withdraw_lock", -amount, float(row["balance"]), float(row["locked_balance"]),
-                   "requested", ref=f"WREQ:{wid}", note=f"Withdraw requested via {method}: {account}")
-    db.commit(); db.close()
+        # record withdrawal request as processing
+        cur.execute("""INSERT INTO withdrawal_requests
+            (user_id, amount, net_amount, fee_amount, upi, status)
+            VALUES (?,?,?,?,?,'processing')""", (g.user_id, amount, net, fee_total, upi_id))
+        wreq_id = cur.lastrowid
+        db.commit()
+    except Exception as e:
+        db.rollback(); db.close()
+        return err(str(e), 400)
 
-    return jsonify({"ok": True, "request_id": wid, "message":"withdrawal requested & funds locked",
-                    "balance": round(float(row["balance"]),2),
-                    "locked": round(float(row["locked_balance"]),2)}), 200
+    # call Razorpay outside transaction
+    ok_pay, res = _razorpay_payout_upi(upi_id, net, ref=f"WREQ:{wreq_id}")
 
-app.register_blueprint(wallet_bp)   # ✅ Wallet routes
+    db = get_db(); cur = db.cursor()
+    try:
+        db.execute("BEGIN IMMEDIATE")
+        if not ok_pay:
+            # release lock
+            cur.execute("""
+                UPDATE users
+                SET balance = balance + ?, locked_balance = locked_balance - ?
+                WHERE id=?""", (amount, amount, g.user_id))
+            rrel = cur.execute("SELECT balance, locked_balance FROM users WHERE id=?", (g.user_id,)).fetchone()
+            cur.execute("""INSERT INTO wallet_txns
+                (user_id,kind,amount,balance_after,locked_after,status,ref,note,meta)
+                VALUES (?,?,?,?,?,'failed',?, ?, ?)""",
+                (g.user_id, "withdraw_release", amount, rrel["balance"], rrel["locked_balance"],
+                 f"WREQ:{wreq_id}", "payout failed", json.dumps({"err": str(res)[:240]})))
+            cur.execute("UPDATE withdrawal_requests SET status='failed', reason=?, updated_at=CURRENT_TIMESTAMP WHERE id=?",
+                        (str(res)[:240], wreq_id))
+            db.commit(); db.close()
+            return err("payout failed", 502, extra={"details": str(res)})
 
-# ----------------------
+        # success: clear lock, credit pooled fee, mark paid
+        payout_id = res.get("id") if isinstance(res, dict) else None
+        cur.execute("UPDATE users SET locked_balance = locked_balance - ? WHERE id=?", (amount, g.user_id))
+        rset = cur.execute("SELECT balance, locked_balance FROM users WHERE id=?", (g.user_id,)).fetchone()
+        cur.execute("""INSERT INTO wallet_txns
+            (user_id,kind,amount,balance_after,locked_after,status,ref,note,meta)
+            VALUES (?,?,?,?,?,'success',?, ?, NULL)""",
+            (g.user_id, "withdraw_settle", 0.0, rset["balance"], rset["locked_balance"],
+             f"WREQ:{wreq_id}", f"payout success: {payout_id}"))
+
+        # add the ENTIRE fee to the single pool
+        cur.execute("""
+            UPDATE fee_pool
+            SET pool_balance = pool_balance + ?, updated_at = CURRENT_TIMESTAMP
+            WHERE id=1
+        """, (fee_total,))
+
+        cur.execute("UPDATE withdrawal_requests SET status='paid', payout_id=?, updated_at=CURRENT_TIMESTAMP WHERE id=?",
+                    (payout_id, wreq_id))
+        db.commit()
+    except Exception as e:
+        db.rollback(); db.close()
+        return err("post-payout update failed", 500, extra={"details": str(e)})
+    db.close()
+
+    return ok({
+        "message": "withdrawal processed",
+        "request_id": wreq_id,
+        "net_paid": net,
+        "fee": fee_total,
+        "payout_id": payout_id
+    })
+
+# register wallet blueprint once
+app.register_blueprint(wallet_bp)
+
+
+
+# ----------------------                                                                                                          
 # GitHub helpers
 # ----------------------
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN", "")
@@ -1447,8 +1768,10 @@ def github_gist():
         return jsonify({"error": res}), 400
     return jsonify({"ok": True, "url": res})
 
+
+
 # ----------------------
-# Start-up: init DB and writer non-fatally
+# Start-up: init DB and writer non-fatally                                                                                       
 # ----------------------
 try:
     init_db()
@@ -1459,6 +1782,8 @@ try:
     start_writer()
 except Exception as e:
     print("[hh] start_writer failed (nonfatal):", e)
+
+
 
 # ----------------------
 # Run app
