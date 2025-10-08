@@ -18,6 +18,43 @@ import re, json, logging
 from werkzeug.exceptions import HTTPException
 from passlib.hash import pbkdf2_sha256
 
+# ==== Cross-DB adapter (SQLite or Postgres) ===================================
+import os, sqlite3
+from urllib.parse import urlparse
+
+DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///db.sqlite3")
+IS_PG = DATABASE_URL.startswith("postgres://") or DATABASE_URL.startswith("postgresql://")
+
+if IS_PG:
+    import psycopg2, psycopg2.extras
+
+class _PgConnAdapter:
+    """Adapter that mimics sqlite3.Connection API enough for the app."""
+    def __init__(self, conn):
+        self._conn = conn
+    def execute(self, sql, params=()):
+        cur = self._conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        cur.execute(sql, params)
+        return cur
+    def cursor(self):
+        return self._conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+    def commit(self): self._conn.commit()
+    def rollback(self): self._conn.rollback()
+    def close(self): self._conn.close()
+
+def get_db():
+    if IS_PG:
+        # Railway Postgres usually needs SSL
+        conn = psycopg2.connect(DATABASE_URL, sslmode="require")
+        conn.autocommit = False
+        return _PgConnAdapter(conn)
+    # SQLite fallback (local dev)
+    db_file = DATABASE_URL.replace("sqlite:///", "")
+    conn = sqlite3.connect(db_file)
+    conn.row_factory = sqlite3.Row
+    return conn
+# ==============================================================================
+
 
 # --- SQLite helper for Termux/mobile ---
 import sqlite3
@@ -478,6 +515,100 @@ AUTO_SCHEMA_PATTERNS = (
     "unknown column",
     "table .* has no column"
 )
+
+def ensure_live_schema_pg():
+    """Create/upgrade tables in Postgres. Safe to run repeatedly."""
+    db = get_db(); cur = db.cursor()
+    try:
+        # users
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS users (
+            id              SERIAL PRIMARY KEY,
+            name            TEXT,
+            mobile          TEXT UNIQUE,
+            password_hash   TEXT,
+            email           TEXT,
+            address         TEXT,
+            is_banned       INTEGER DEFAULT 0,
+            is_verified     INTEGER DEFAULT 0,
+            balance         NUMERIC(12,2) DEFAULT 0,
+            locked_balance  NUMERIC(12,2) DEFAULT 0,
+            verification_code TEXT,
+            verify_expires  BIGINT,
+            created_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )""")
+
+        # refresh_tokens
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS refresh_tokens(
+            jti         TEXT PRIMARY KEY,
+            user_id     INTEGER NOT NULL REFERENCES users(id),
+            issued_at   BIGINT NOT NULL,
+            expires_at  BIGINT NOT NULL,
+            revoked     INTEGER NOT NULL DEFAULT 0
+        )""")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_refresh_user ON refresh_tokens(user_id)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_refresh_exp  ON refresh_tokens(expires_at)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_refresh_rev  ON refresh_tokens(revoked)")
+
+        # wallet_txns
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS wallet_txns (
+            id              SERIAL PRIMARY KEY,
+            user_id         INTEGER NOT NULL REFERENCES users(id),
+            kind            TEXT NOT NULL,
+            amount          NUMERIC(12,2) NOT NULL,
+            balance_after   NUMERIC(12,2) NOT NULL,
+            locked_after    NUMERIC(12,2) NOT NULL,
+            status          TEXT NOT NULL,
+            ref             TEXT,
+            note            TEXT,
+            meta            JSONB,
+            created_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )""")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_txn_user ON wallet_txns(user_id)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_txn_created ON wallet_txns(created_at)")
+
+        # withdrawal_requests
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS withdrawal_requests(
+            id          SERIAL PRIMARY KEY,
+            user_id     INTEGER NOT NULL REFERENCES users(id),
+            amount      NUMERIC(12,2) NOT NULL,
+            net_amount  NUMERIC(12,2) NOT NULL,
+            fee_amount  NUMERIC(12,2) NOT NULL,
+            upi         TEXT,
+            payout_id   TEXT,
+            status      TEXT NOT NULL DEFAULT 'requested',
+            reason      TEXT,
+            created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at  TIMESTAMP
+        )""")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_wreq_user ON withdrawal_requests(user_id)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_wreq_status ON withdrawal_requests(status)")
+
+        # unified fee pool
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS fee_pool (
+            id           INTEGER PRIMARY KEY,
+            pool_balance NUMERIC(12,2) NOT NULL DEFAULT 0,
+            updated_at   TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )""")
+        cur.execute("INSERT INTO fee_pool (id, pool_balance) VALUES (1,0) ON CONFLICT (id) DO NOTHING")
+
+        db.commit()
+        print("[migrate:pg] ✅ schema ensured")
+    except Exception as e:
+        db.rollback()
+        print("[migrate:pg] ⚠️", e)
+    finally:
+        db.close()
+
+# Call exactly once at boot:
+if IS_PG:
+    ensure_live_schema_pg()
+else:
+    ensure_live_schema()   # your existing SQLite path
 
 def _repair_fee_pool():
     db = get_db(); cur = db.cursor()
@@ -1522,19 +1653,20 @@ def version():
 
 @app.route("/debug/whichdb", methods=["GET"])
 def debug_whichdb():
-    import sqlite3
-    db_file = os.environ.get("DATABASE_URL") or "db.sqlite3"
-    if db_file.startswith("sqlite:///"):
-        db_file = db_file.replace("sqlite:///", "")
-    info = {"db_file": db_file, "exists": os.path.exists(db_file)}
-    try:
-        conn = sqlite3.connect(db_file)
-        cur = conn.cursor()
-        cur.execute("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name")
-        info["tables"] = [r[0] for r in cur.fetchall()]
-        conn.close()
-    except Exception as e:
-        info["error"] = str(e)
+    info = {}
+    if IS_PG:
+        info["engine"] = "postgres"
+        info["url"] = DATABASE_URL[:60] + "..." if DATABASE_URL else None
+        try:
+            db = get_db()
+            row = db.execute("SELECT version() AS v").fetchone()
+            info["version"] = row["v"] if row else None
+            db.close()
+        except Exception as e:
+            info["error"] = str(e)
+    else:
+        db_file = DATABASE_URL.replace("sqlite:///", "")
+        info = {"engine":"sqlite", "db_file": db_file, "exists": os.path.exists(db_file)}
     return jsonify(info)
 
 
