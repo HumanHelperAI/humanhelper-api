@@ -253,46 +253,33 @@ print(f"[db] engine={'postgres' if IS_PG else 'sqlite'} url={DATABASE_URL.split(
 
 
 # ---- Cross-DB SQL helpers ----                                                                       
-import re
-
 def _fix_placeholders(sql: str) -> str:
-    """Translate SQLite ? params to Postgres %s, leave others as-is."""
-    if IS_PG:
-        # Don't touch %s already present
-        # Replace bare ? with %s
-        parts = []
-        q = 0
-        for ch in sql:
-            if ch == '?' and q == 0:
-                parts.append('%s')
-            else:
-                parts.append(ch)
-                if ch in ("'", '"'):
-                    q = 1 - q  # naive quote toggle to avoid replacing inside strings
-        return ''.join(parts)
-    return sql
+    # convert SQLite "?" params to Postgres "%s" (outside quotes only)
+    if not IS_PG: 
+        return sql
+    out, in_q = [], False
+    for ch in sql:
+        if ch in ("'", '"'):
+            in_q = not in_q
+            out.append(ch)
+        elif ch == "?" and not in_q:
+            out.append("%s")
+        else:
+            out.append(ch)
+    return "".join(out)
 
 def execq(db, sql: str, params: tuple = ()):
-    """Unified execute: fixes placeholders automatically."""
-    sql2 = _fix_placeholders(sql)
-    return db.execute(sql2, params)
+    return db.execute(_fix_placeholders(sql), params)
 
 def insert_ret_id(db, sql: str, params: tuple = ()) -> int:
-    """
-    Insert row and return its id on both SQLite and Postgres.
-    If query lacks RETURNING id on PG, we append it.
-    """
     sql2 = _fix_placeholders(sql)
-    if IS_PG and 'returning' not in sql2.lower():
+    if IS_PG and "returning" not in sql2.lower():
         sql2 = sql2.rstrip() + " RETURNING id"
         cur = db.execute(sql2, params)
         row = cur.fetchone()
-        return int(row["id"]) if row and "id" in row else int(row[0])
-    else:
-        cur = db.execute(sql2, params)
-        # sqlite
-        return int(getattr(cur, "lastrowid", 0) or 0)
-
+        return int(row["id"] if isinstance(row, dict) else row[0])
+    cur = db.execute(sql2, params)
+    return int(getattr(cur, "lastrowid", 0) or 0)
 
 
 # ----------------------                                                              
@@ -385,281 +372,168 @@ def _col_exists(cur, table: str, col: str) -> bool:
     except Exception:
         return False
 
-def ensure_live_schema():
-    """
-    Idempotent, safe to call many times.
-    Creates tables and adds missing columns used by the app.
-    """
-    db = get_db()
-    cur = db.cursor()
-    try:
-        # --- users ---
-        if not _table_exists(cur, "users"):
-            cur.execute("""
-                CREATE TABLE users (
-                  id INTEGER PRIMARY KEY AUTOINCREMENT,
-                  name TEXT,
-                  mobile TEXT UNIQUE,
-                  password_hash TEXT,
-                  email TEXT,
-                  address TEXT,
-                  is_verified INTEGER DEFAULT 0,
-                  is_banned  INTEGER DEFAULT 0,
-                  balance REAL DEFAULT 0,
-                  locked_balance REAL DEFAULT 0,
-                  verification_code TEXT,
-                  verify_expires INTEGER,
-                  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                )
-            """)
-        else:
-            for col, ddl in [
-                ("email",           "ALTER TABLE users ADD COLUMN email TEXT"),
-                ("address",         "ALTER TABLE users ADD COLUMN address TEXT"),
-                ("is_verified",     "ALTER TABLE users ADD COLUMN is_verified INTEGER DEFAULT 0"),
-                ("is_banned",       "ALTER TABLE users ADD COLUMN is_banned  INTEGER DEFAULT 0"),
-                ("balance",         "ALTER TABLE users ADD COLUMN balance REAL DEFAULT 0"),
-                ("locked_balance",  "ALTER TABLE users ADD COLUMN locked_balance REAL DEFAULT 0"),
-                ("verification_code","ALTER TABLE users ADD COLUMN verification_code TEXT"),
-                ("verify_expires",  "ALTER TABLE users ADD COLUMN verify_expires INTEGER"),
-            ]:
-                if not _col_exists(cur, "users", col):
-                    cur.execute(ddl)
-
-        # --- refresh_tokens ---
-        if not _table_exists(cur, "refresh_tokens"):
-            cur.execute("""
-                CREATE TABLE refresh_tokens(
-                  jti TEXT PRIMARY KEY,
-                  user_id INTEGER NOT NULL,
-                  issued_at INTEGER NOT NULL,
-                  expires_at INTEGER NOT NULL,
-                  revoked INTEGER NOT NULL DEFAULT 0,
-                  FOREIGN KEY(user_id) REFERENCES users(id)
-                )
-            """)
-            cur.execute("CREATE INDEX IF NOT EXISTS idx_refresh_user ON refresh_tokens(user_id)")
-            cur.execute("CREATE INDEX IF NOT EXISTS idx_refresh_exp  ON refresh_tokens(expires_at)")
-            cur.execute("CREATE INDEX IF NOT EXISTS idx_refresh_rev  ON refresh_tokens(revoked)")
-
-        # --- wallet_txns (immutable ledger) ---
-        if not _table_exists(cur, "wallet_txns"):
-            cur.execute("""
-                CREATE TABLE wallet_txns (
-                  id INTEGER PRIMARY KEY AUTOINCREMENT,
-                  user_id INTEGER NOT NULL,
-                  kind TEXT NOT NULL,
-                  amount REAL NOT NULL,
-                  balance_after REAL NOT NULL,
-                  locked_after REAL NOT NULL,
-                  status TEXT NOT NULL,
-                  ref TEXT,
-                  note TEXT,
-                  meta TEXT,
-                  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                  FOREIGN KEY(user_id) REFERENCES users(id)
-                )
-            """)
-
-        # --- withdrawal_requests ---
-        if not _table_exists(cur, "withdrawal_requests"):
-            cur.execute("""
-                CREATE TABLE withdrawal_requests(
-                  id INTEGER PRIMARY KEY AUTOINCREMENT,
-                  user_id INTEGER NOT NULL,
-                  amount REAL NOT NULL,
-                  net_amount REAL,
-                  fee_amount REAL,
-                  upi TEXT,
-                  payout_id TEXT,
-                  status TEXT NOT NULL DEFAULT 'requested',
-                  reason TEXT,
-                  method TEXT,
-                  account TEXT,
-                  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                  updated_at TIMESTAMP
-                )
-            """)
-
-        # --- fee_pool (single combined account) ---
-        if not _table_exists(cur, "fee_pool"):
-            cur.execute("""
-                CREATE TABLE fee_pool (
-                  id INTEGER PRIMARY KEY CHECK (id=1),
-                  pool_balance REAL NOT NULL DEFAULT 0,
-                  updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                )
-            """)
-        else:
-            if not _col_exists(cur, "fee_pool", "pool_balance"):
-                cur.execute("ALTER TABLE fee_pool ADD COLUMN pool_balance REAL DEFAULT 0")
-            if not _col_exists(cur, "fee_pool", "updated_at"):
-                cur.execute("ALTER TABLE fee_pool ADD COLUMN updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP")
-
-        # seed single row
-        cur.execute("INSERT OR IGNORE INTO fee_pool (id, pool_balance) VALUES (1, 0)")
-
-        db.commit()
-        print("[migrate] ✅ Live schema check complete")
-    except Exception as e:
-        db.rollback()
-        print("[migrate] ⚠️ Live schema update warning:", e)
-    finally:
-        db.close()
-
-# Call once at import time (safe/idempotent)
-try:
-    ensure_live_schema()
-except Exception as _e:
-    print("[migrate] init warning:", _e)
-
-# Heal on the next request if a schema error pops up
-AUTO_SCHEMA_PATTERNS = (
-    "no such table",
-    "no such column",
-    "has no column",
-    "unknown column",
-    "table .* has no column"
-)
-
+# ---------- AUTO MIGRATION (Postgres) ----------
 def ensure_live_schema_pg():
-    """Create/upgrade tables in Postgres. Safe to run repeatedly."""
+    """Create/upgrade tables for Postgres. Safe to run repeatedly."""
     db = get_db(); cur = db.cursor()
     try:
         # users
-        cur.execute("""
+        execq(db, """
         CREATE TABLE IF NOT EXISTS users (
-            id              SERIAL PRIMARY KEY,
-            name            TEXT,
-            mobile          TEXT UNIQUE,
-            password_hash   TEXT,
-            email           TEXT,
-            address         TEXT,
-            is_banned       INTEGER DEFAULT 0,
-            is_verified     INTEGER DEFAULT 0,
-            balance         NUMERIC(12,2) DEFAULT 0,
-            locked_balance  NUMERIC(12,2) DEFAULT 0,
-            verification_code TEXT,
-            verify_expires  BIGINT,
-            created_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )""")
+          id              SERIAL PRIMARY KEY,
+          name            TEXT,
+          mobile          TEXT UNIQUE,
+          password_hash   TEXT,
+          email           TEXT,
+          address         TEXT,
+          is_verified     INTEGER DEFAULT 0,
+          is_banned       INTEGER DEFAULT 0,
+          balance         NUMERIC(12,2) DEFAULT 0,
+          locked_balance  NUMERIC(12,2) DEFAULT 0,
+          verification_code TEXT,
+          verify_expires  BIGINT,
+          created_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+        """)
+        execq(db, "ALTER TABLE users ADD COLUMN IF NOT EXISTS email TEXT")
+        execq(db, "ALTER TABLE users ADD COLUMN IF NOT EXISTS address TEXT")
+        execq(db, "ALTER TABLE users ADD COLUMN IF NOT EXISTS is_verified INTEGER DEFAULT 0")
+        execq(db, "ALTER TABLE users ADD COLUMN IF NOT EXISTS is_banned  INTEGER DEFAULT 0")
+        execq(db, "ALTER TABLE users ADD COLUMN IF NOT EXISTS balance NUMERIC(12,2) DEFAULT 0")
+        execq(db, "ALTER TABLE users ADD COLUMN IF NOT EXISTS locked_balance NUMERIC(12,2) DEFAULT 0")
+        execq(db, "ALTER TABLE users ADD COLUMN IF NOT EXISTS verification_code TEXT")
+        execq(db, "ALTER TABLE users ADD COLUMN IF NOT EXISTS verify_expires BIGINT")
 
         # refresh_tokens
-        cur.execute("""
+        execq(db, """
         CREATE TABLE IF NOT EXISTS refresh_tokens(
-            jti         TEXT PRIMARY KEY,
-            user_id     INTEGER NOT NULL REFERENCES users(id),
-            issued_at   BIGINT NOT NULL,
-            expires_at  BIGINT NOT NULL,
-            revoked     INTEGER NOT NULL DEFAULT 0
-        )""")
-        cur.execute("CREATE INDEX IF NOT EXISTS idx_refresh_user ON refresh_tokens(user_id)")
-        cur.execute("CREATE INDEX IF NOT EXISTS idx_refresh_exp  ON refresh_tokens(expires_at)")
-        cur.execute("CREATE INDEX IF NOT EXISTS idx_refresh_rev  ON refresh_tokens(revoked)")
+          jti        TEXT PRIMARY KEY,
+          user_id    INTEGER NOT NULL REFERENCES users(id),
+          issued_at  BIGINT NOT NULL,
+          expires_at BIGINT NOT NULL,
+          revoked    INTEGER NOT NULL DEFAULT 0
+        )
+        """)
+        execq(db, "CREATE INDEX IF NOT EXISTS idx_refresh_user ON refresh_tokens(user_id)")
+        execq(db, "CREATE INDEX IF NOT EXISTS idx_refresh_exp  ON refresh_tokens(expires_at)")
+        execq(db, "CREATE INDEX IF NOT EXISTS idx_refresh_rev  ON refresh_tokens(revoked)")
 
         # wallet_txns
-        cur.execute("""
+        execq(db, """
         CREATE TABLE IF NOT EXISTS wallet_txns (
-            id              SERIAL PRIMARY KEY,
-            user_id         INTEGER NOT NULL REFERENCES users(id),
-            kind            TEXT NOT NULL,
-            amount          NUMERIC(12,2) NOT NULL,
-            balance_after   NUMERIC(12,2) NOT NULL,
-            locked_after    NUMERIC(12,2) NOT NULL,
-            status          TEXT NOT NULL,
-            ref             TEXT,
-            note            TEXT,
-            meta            JSONB,
-            created_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )""")
-        cur.execute("CREATE INDEX IF NOT EXISTS idx_txn_user ON wallet_txns(user_id)")
-        cur.execute("CREATE INDEX IF NOT EXISTS idx_txn_created ON wallet_txns(created_at)")
+          id             SERIAL PRIMARY KEY,
+          user_id        INTEGER NOT NULL REFERENCES users(id),
+          kind           TEXT NOT NULL,
+          amount         NUMERIC(12,2) NOT NULL,
+          balance_after  NUMERIC(12,2) NOT NULL,
+          locked_after   NUMERIC(12,2) NOT NULL,
+          status         TEXT NOT NULL,
+          ref            TEXT,
+          note           TEXT,
+          meta           JSONB,
+          created_at     TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+        """)
+        execq(db, "CREATE INDEX IF NOT EXISTS idx_txn_user    ON wallet_txns(user_id)")
+        execq(db, "CREATE INDEX IF NOT EXISTS idx_txn_created ON wallet_txns(created_at)")
 
         # withdrawal_requests
-        cur.execute("""
+        execq(db, """
         CREATE TABLE IF NOT EXISTS withdrawal_requests(
-            id          SERIAL PRIMARY KEY,
-            user_id     INTEGER NOT NULL REFERENCES users(id),
-            amount      NUMERIC(12,2) NOT NULL,
-            net_amount  NUMERIC(12,2) NOT NULL,
-            fee_amount  NUMERIC(12,2) NOT NULL,
-            upi         TEXT,
-            payout_id   TEXT,
-            status      TEXT NOT NULL DEFAULT 'requested',
-            reason      TEXT,
-            created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            updated_at  TIMESTAMP
-        )""")
-        cur.execute("CREATE INDEX IF NOT EXISTS idx_wreq_user ON withdrawal_requests(user_id)")
-        cur.execute("CREATE INDEX IF NOT EXISTS idx_wreq_status ON withdrawal_requests(status)")
+          id         SERIAL PRIMARY KEY,
+          user_id    INTEGER NOT NULL REFERENCES users(id),
+          amount     NUMERIC(12,2) NOT NULL,
+          net_amount NUMERIC(12,2),
+          fee_amount NUMERIC(12,2),
+          upi        TEXT,
+          payout_id  TEXT,
+          status     TEXT NOT NULL DEFAULT 'requested',
+          reason     TEXT,
+          method     TEXT,
+          account    TEXT,
+          created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+          updated_at TIMESTAMP
+        )
+        """)
+        execq(db, "CREATE INDEX IF NOT EXISTS idx_wreq_user   ON withdrawal_requests(user_id)")
+        execq(db, "CREATE INDEX IF NOT EXISTS idx_wreq_status ON withdrawal_requests(status)")
 
-        # unified fee pool
-        cur.execute("""
+        # fee_pool (single bucket)
+        execq(db, """
         CREATE TABLE IF NOT EXISTS fee_pool (
-            id           INTEGER PRIMARY KEY,
-            pool_balance NUMERIC(12,2) NOT NULL DEFAULT 0,
-            updated_at   TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )""")
-        cur.execute("INSERT INTO fee_pool (id, pool_balance) VALUES (1,0) ON CONFLICT (id) DO NOTHING")
+          id           INTEGER PRIMARY KEY,
+          pool_balance NUMERIC(12,2) NOT NULL DEFAULT 0,
+          updated_at   TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+        """)
+        execq(db, "INSERT INTO fee_pool (id, pool_balance) VALUES (1,0) ON CONFLICT (id) DO NOTHING")
 
         db.commit()
         print("[migrate:pg] ✅ schema ensured")
     except Exception as e:
         db.rollback()
         print("[migrate:pg] ⚠️", e)
-    finally:
-        db.close()
-
-# Call exactly once at boot:
-if IS_PG:
-    ensure_live_schema_pg()
-else:
-    ensure_live_schema()   # your existing SQLite path
-
-def _repair_fee_pool():
-    db = get_db(); cur = db.cursor()
-    try:
-        db.execute("BEGIN IMMEDIATE")
-        cur.execute("""
-            CREATE TABLE IF NOT EXISTS fee_pool (
-              id INTEGER PRIMARY KEY CHECK (id=1),
-              pool_balance REAL NOT NULL DEFAULT 0,
-              updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-        """)
-        # ensure columns
-        cur.execute("PRAGMA table_info(fee_pool)")
-        cols = {r[1] for r in cur.fetchall()}
-        if "pool_balance" not in cols:
-            cur.execute("ALTER TABLE fee_pool ADD COLUMN pool_balance REAL DEFAULT 0")
-        if "updated_at" not in cols:
-            cur.execute("ALTER TABLE fee_pool ADD COLUMN updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP")
-        cur.execute("INSERT OR IGNORE INTO fee_pool (id, pool_balance) VALUES (1,0)")
-        db.commit()
-    except Exception:
-        db.rollback()
         raise
     finally:
         db.close()
 
-def _maybe_fix_schema_from_error(e: Exception):
-    """Lightweight auto-fix for common sqlite migration errors."""
-    msg = (str(e) or "").lower()
-    try:
-        if "no such table: fee_pool" in msg or "no such column: pool_balance" in msg:
-            _repair_fee_pool()
-        if "no such table" in msg or "no such column" in msg:
-            ensure_live_schema()
-    except Exception:
-        # swallow in auto-fix; original handler will still respond
-        pass
+# Call exactly once at boot:
+try:
+    if IS_PG:
+        ensure_live_schema_pg()
+    else:
+        ensure_live_schema()  # your SQLite function from the snippet you posted
+except Exception as e:
+    print("[migrate] init warning:", e)
 
-# When SQLite schema errors bubble up, auto-fix for next request
-@app.errorhandler(sqlite3.OperationalError)
-def _sqlite_op_error(e):
-    _maybe_fix_schema_from_error(e)
-    # Return a clean JSON; next request will usually succeed
-    return jsonify({"ok": False, "error": {"code": "internal_error", "message": "Internal server error"}}), 500
+
+# Heal on the next request if a schema error pops up
+def _repair_fee_pool():
+    db = get_db(); cur = db.cursor()
+    try:
+        if IS_PG:
+            execq(db, """
+            CREATE TABLE IF NOT EXISTS fee_pool (
+              id           INTEGER PRIMARY KEY,
+              pool_balance NUMERIC(12,2) NOT NULL DEFAULT 0,
+              updated_at   TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )""")
+            execq(db, "INSERT INTO fee_pool (id, pool_balance) VALUES (1,0) ON CONFLICT (id) DO NOTHING")
+        else:
+            execq(db, """
+            CREATE TABLE IF NOT EXISTS fee_pool (
+              id INTEGER PRIMARY KEY CHECK (id=1),
+              pool_balance REAL NOT NULL DEFAULT 0,
+              updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )""")
+            execq(db, "INSERT OR IGNORE INTO fee_pool (id, pool_balance) VALUES (1,0)")
+        db.commit()
+    except Exception:
+        db.rollback(); raise
+    finally:
+        db.close()
+
+
+AUTO_SCHEMA_PATTERNS = (
+    "no such table",
+    "no such column",
+    "has no column",
+    "unknown column",
+    "relation \"" ,               # PG: relation "table" does not exist
+    "does not exist",
+    "column "                     # PG: column xyz does not exist
+)
+
+def _maybe_fix_schema_from_error(e: Exception):
+    msg = (str(e) or "").lower()
+    if any(p in msg for p in AUTO_SCHEMA_PATTERNS):
+        try:
+            if IS_PG:
+                ensure_live_schema_pg()
+            else:
+                ensure_live_schema()
+        except Exception:
+            pass
 
 # Also run occasionally to keep things tidy
 @app.before_request
@@ -706,35 +580,54 @@ def admin_fees_read():
 @admin_bp.post("/wallet/fees/transfer")
 @admin_required
 def admin_fees_transfer():
+    """
+    Decrease the shared fee pool by `amount` (for charity/ops payouts, etc.).
+    Works on both SQLite and Postgres via execq()/placeholder shim.
+    """
     d = request.get_json(silent=True) or {}
-    amt = float(d.get("amount") or 0)
-    note = (d.get("note") or "").strip()
-    if amt <= 0:
-        return jsonify({"ok": False, "error": {"code":"bad_request","message":"amount must be > 0"}}), 400
-
-    db = get_db(); cur = db.cursor()
     try:
-        db.execute("BEGIN IMMEDIATE")
-        row = cur.execute("SELECT pool_balance FROM fee_pool WHERE id=1").fetchone()
-        bal = float(row["pool_balance"] if row else 0)
+        amt = float(d.get("amount") or 0)
+    except Exception:
+        amt = 0.0
+    note = (d.get("note") or "").strip()
+
+    if amt <= 0:
+        return jsonify({"ok": False, "error": {"code": "bad_request", "message": "amount must be > 0"}}), 400
+
+    db = get_db()
+    try:
+        # start tx (sqlite accepts "BEGIN", pg treats as BEGIN)
+        execq(db, "BEGIN")
+
+        row = execq(db, "SELECT pool_balance FROM fee_pool WHERE id=1").fetchone()
+        bal = float(row["pool_balance"] if row else 0.0)
+
         if bal < amt:
             db.rollback(); db.close()
-            return jsonify({"ok": False, "error":{"code":"insufficient","message":"insufficient pool balance"}}), 400
+            return jsonify({
+                "ok": False,
+                "error": {"code": "insufficient", "message": "insufficient pool balance"}
+            }), 400
 
-        cur.execute("""
+        execq(db, """
             UPDATE fee_pool
-            SET pool_balance = pool_balance - ?,
-                updated_at = CURRENT_TIMESTAMP
-            WHERE id=1
+               SET pool_balance = pool_balance - ?, 
+                   updated_at   = CURRENT_TIMESTAMP
+             WHERE id = 1
         """, (amt,))
+
         db.commit()
     except Exception as e:
-        db.rollback()
-        db.close()
-        _maybe_fix_schema_from_error(e)
-        return jsonify({"ok": False, "error":{"code":"internal_error","message":str(e)}}), 500
+        db.rollback(); db.close()
+        _maybe_fix_schema_from_error(e)   # harmless no-op on PG if you implemented it that way
+        return jsonify({"ok": False, "error": {"code": "internal_error", "message": str(e)}}), 500
+
     db.close()
-    return jsonify({"ok": True, "transferred": amt, "note": note or None})
+    return jsonify({"ok": True, "transferred": amt, "note": (note or None)}})
+
+
+
+
 
 # ----- List users (search) -----
 @admin_bp.get("/users")
