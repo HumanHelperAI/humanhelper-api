@@ -623,10 +623,7 @@ def admin_fees_transfer():
         return jsonify({"ok": False, "error": {"code": "internal_error", "message": str(e)}}), 500
 
     db.close()
-    return jsonify({"ok": True, "transferred": amt, "note": (note or None)}})
-
-
-
+    return jsonify({"ok": True, "transferred": amt, "note": (note or None)})
 
 
 # ----- List users (search) -----
