@@ -479,13 +479,43 @@ AUTO_SCHEMA_PATTERNS = (
     "table .* has no column"
 )
 
-def _maybe_fix_schema_from_error(err: Exception):
-    msg = (str(err) or "").lower()
-    if any(pat in msg for pat in AUTO_SCHEMA_PATTERNS):
-        try:
+def _repair_fee_pool():
+    db = get_db(); cur = db.cursor()
+    try:
+        db.execute("BEGIN IMMEDIATE")
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS fee_pool (
+              id INTEGER PRIMARY KEY CHECK (id=1),
+              pool_balance REAL NOT NULL DEFAULT 0,
+              updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        # ensure columns
+        cur.execute("PRAGMA table_info(fee_pool)")
+        cols = {r[1] for r in cur.fetchall()}
+        if "pool_balance" not in cols:
+            cur.execute("ALTER TABLE fee_pool ADD COLUMN pool_balance REAL DEFAULT 0")
+        if "updated_at" not in cols:
+            cur.execute("ALTER TABLE fee_pool ADD COLUMN updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP")
+        cur.execute("INSERT OR IGNORE INTO fee_pool (id, pool_balance) VALUES (1,0)")
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
+    finally:
+        db.close()
+
+def _maybe_fix_schema_from_error(e: Exception):
+    """Lightweight auto-fix for common sqlite migration errors."""
+    msg = (str(e) or "").lower()
+    try:
+        if "no such table: fee_pool" in msg or "no such column: pool_balance" in msg:
+            _repair_fee_pool()
+        if "no such table" in msg or "no such column" in msg:
             ensure_live_schema()
-        except Exception as _:
-            pass
+    except Exception:
+        # swallow in auto-fix; original handler will still respond
+        pass
 
 # When SQLite schema errors bubble up, auto-fix for next request
 @app.errorhandler(sqlite3.OperationalError)
@@ -784,6 +814,12 @@ def admin_fix_fee_pool():
     except Exception as e:
         db.rollback(); db.close()
         return jsonify({"ok": False, "error": {"code":"internal_error","message": str(e)}}), 500
+
+@admin_bp.post("/tools/repair-withdrawals")
+@admin_required
+def admin_repair_withdrawals():
+    n = _repair_stuck_withdrawals(max_age_min=0)  # repair immediately
+    return jsonify({"ok": True, "released": n})
 
 # ✅ Register admin blueprint once (AFTER all routes above are defined)
 app.register_blueprint(admin_bp)
@@ -1370,15 +1406,75 @@ def validate_mobile(m: str) -> bool:
 def options_any(anypath):
     return ("", 204)
 
+def _repair_stuck_withdrawals(max_age_min: int = 10, batch_limit: int = 50):
+    """
+    If a withdrawal sits in 'processing' too long (e.g., Razorpay unreachable),
+    release the user's locked funds and mark the request 'failed'.
+    """
+    db = get_db(); cur = db.cursor()
+    try:
+        cur.execute("""
+            SELECT id, user_id, amount
+            FROM withdrawal_requests
+            WHERE status='processing'
+              AND datetime(created_at) <= datetime('now', ?)
+            ORDER BY id ASC
+            LIMIT ?
+        """, (f'-{max_age_min} minutes', batch_limit))
+        stuck = cur.fetchall()
+        if not stuck:
+            db.close(); return 0
+
+        n = 0
+        for r in stuck:
+            wid, uid, amount = r["id"], int(r["user_id"]), float(r["amount"])
+            try:
+                db.execute("BEGIN IMMEDIATE")
+                # release lock back to balance
+                cur.execute("""
+                    UPDATE users
+                       SET balance = balance + ?, locked_balance = locked_balance - ?
+                     WHERE id=? AND locked_balance >= ?
+                """, (amount, amount, uid, amount))
+                # ledger
+                cur.execute("SELECT balance, locked_balance FROM users WHERE id=?", (uid,))
+                b = cur.fetchone()
+                bal_after = float(b["balance"] or 0)
+                lock_after = float(b["locked_balance"] or 0)
+                cur.execute("""
+                    INSERT INTO wallet_txns (user_id,kind,amount,balance_after,locked_after,status,ref,note)
+                    VALUES (?,?,?,?,?,?,?,?)
+                """, (uid, "withdraw_release", +amount, bal_after, lock_after, "failed",
+                      f"WREQ:{wid}", "auto-repair: payout stale"))
+                # mark failed
+                cur.execute("""
+                    UPDATE withdrawal_requests
+                       SET status='failed', reason='auto-repair: payout stale',
+                           updated_at=CURRENT_TIMESTAMP
+                     WHERE id=?
+                """, (wid,))
+                db.commit()
+                n += 1
+            except Exception as e:
+                db.rollback()
+                _maybe_fix_schema_from_error(e)
+        db.close()
+        return n
+    except Exception as e:
+        db.close()
+        _maybe_fix_schema_from_error(e)
+        return 0
+
 # light background cleanup thread (non-blocking)
 def _cleanup_loop():
     while True:
         try:
-            # attempt database cleanup if available
             try:
                 cleanup_old_logs()
             except Exception:
                 pass
+            # 🔧 run every cycle
+            _repair_stuck_withdrawals(max_age_min=10)
             time.sleep(6 * 60 * 60)
         except Exception as e:
             print("[hh] Cleanup error:", e)
