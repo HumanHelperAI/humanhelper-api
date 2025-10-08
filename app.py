@@ -252,6 +252,49 @@ print(f"[db] engine={'postgres' if IS_PG else 'sqlite'} url={DATABASE_URL.split(
 
 
 
+# ---- Cross-DB SQL helpers ----                                                                       
+import re
+
+def _fix_placeholders(sql: str) -> str:
+    """Translate SQLite ? params to Postgres %s, leave others as-is."""
+    if IS_PG:
+        # Don't touch %s already present
+        # Replace bare ? with %s
+        parts = []
+        q = 0
+        for ch in sql:
+            if ch == '?' and q == 0:
+                parts.append('%s')
+            else:
+                parts.append(ch)
+                if ch in ("'", '"'):
+                    q = 1 - q  # naive quote toggle to avoid replacing inside strings
+        return ''.join(parts)
+    return sql
+
+def execq(db, sql: str, params: tuple = ()):
+    """Unified execute: fixes placeholders automatically."""
+    sql2 = _fix_placeholders(sql)
+    return db.execute(sql2, params)
+
+def insert_ret_id(db, sql: str, params: tuple = ()) -> int:
+    """
+    Insert row and return its id on both SQLite and Postgres.
+    If query lacks RETURNING id on PG, we append it.
+    """
+    sql2 = _fix_placeholders(sql)
+    if IS_PG and 'returning' not in sql2.lower():
+        sql2 = sql2.rstrip() + " RETURNING id"
+        cur = db.execute(sql2, params)
+        row = cur.fetchone()
+        return int(row["id"]) if row and "id" in row else int(row[0])
+    else:
+        cur = db.execute(sql2, params)
+        # sqlite
+        return int(getattr(cur, "lastrowid", 0) or 0)
+
+
+
 # ----------------------                                                              
 # Flask app init
 # ----------------------
