@@ -99,6 +99,102 @@ def ensure_auth_tables():
     conn.commit()
     conn.close()
 
+def ensure_schema_migrations():
+    db = get_db()
+    cur = db.cursor()
+
+    # ---- users: add missing columns ----
+    cur.execute("PRAGMA table_info(users)")
+    cols = {r[1] for r in cur.fetchall()}
+    if "email" not in cols:
+        cur.execute("ALTER TABLE users ADD COLUMN email TEXT")
+    if "address" not in cols:
+        cur.execute("ALTER TABLE users ADD COLUMN address TEXT")
+    if "locked_balance" not in cols:
+        cur.execute("ALTER TABLE users ADD COLUMN locked_balance REAL DEFAULT 0")
+    if "is_verified" not in cols:
+        cur.execute("ALTER TABLE users ADD COLUMN is_verified INTEGER DEFAULT 0")
+    if "is_banned" not in cols:
+        cur.execute("ALTER TABLE users ADD COLUMN is_banned INTEGER DEFAULT 0")
+
+    # ---- wallet_txns (immutable ledger) ----
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS wallet_txns (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER NOT NULL,
+        kind TEXT NOT NULL,
+        amount REAL NOT NULL,
+        balance_after REAL NOT NULL,
+        locked_after REAL NOT NULL,
+        status TEXT NOT NULL,
+        ref TEXT,
+        note TEXT,
+        meta TEXT,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY(user_id) REFERENCES users(id)
+    )""")
+
+    # ---- withdrawal_requests ----
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS withdrawal_requests(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER NOT NULL,
+        amount REAL NOT NULL,
+        net_amount REAL NOT NULL,
+        fee_amount REAL NOT NULL,
+        upi TEXT,
+        payout_id TEXT,
+        status TEXT NOT NULL DEFAULT 'requested',
+        reason TEXT,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP,
+        FOREIGN KEY(user_id) REFERENCES users(id)
+    )""")
+
+    # ---- fee_pool: migrate old -> new single 'balance' column ----
+    # detect current fee_pool shape
+    cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='fee_pool'")
+    has_fee = cur.fetchone() is not None
+    if not has_fee:
+        cur.execute("""
+        CREATE TABLE fee_pool (
+            id INTEGER PRIMARY KEY CHECK (id=1),
+            balance REAL NOT NULL DEFAULT 0,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )""")
+        cur.execute("INSERT OR IGNORE INTO fee_pool (id, balance) VALUES (1, 0)")
+    else:
+        cur.execute("PRAGMA table_info(fee_pool)")
+        fcols = {r[1] for r in cur.fetchall()}
+        if {"charity_balance", "maintenance_balance"}.issubset(fcols) and "balance" not in fcols:
+            # read old totals
+            cur.execute("SELECT COALESCE(charity_balance,0), COALESCE(maintenance_balance,0) FROM fee_pool WHERE id=1")
+            row = cur.fetchone()
+            total = float((row[0] if row else 0) + (row[1] if row else 0))
+            # migrate: create new table, copy total, drop old
+            cur.execute("ALTER TABLE fee_pool RENAME TO fee_pool_old")
+            cur.execute("""
+            CREATE TABLE fee_pool (
+                id INTEGER PRIMARY KEY CHECK (id=1),
+                balance REAL NOT NULL DEFAULT 0,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )""")
+            cur.execute("INSERT OR REPLACE INTO fee_pool (id, balance) VALUES (1, ?)", (total,))
+            cur.execute("DROP TABLE fee_pool_old")
+        elif "balance" not in fcols:
+            # unexpected shape -> recreate safely with zero
+            cur.execute("DROP TABLE IF EXISTS fee_pool")
+            cur.execute("""
+            CREATE TABLE fee_pool (
+                id INTEGER PRIMARY KEY CHECK (id=1),
+                balance REAL NOT NULL DEFAULT 0,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )""")
+            cur.execute("INSERT OR IGNORE INTO fee_pool (id, balance) VALUES (1, 0)")
+
+    db.commit()
+    db.close()
+
 # --- Wallet schema (single pooled fee) ---
 def ensure_wallet_tables():
     conn = get_db(); cur = conn.cursor()
@@ -153,6 +249,7 @@ def ensure_wallet_tables():
     cur.execute("INSERT OR IGNORE INTO fee_pool (id,pool_balance) VALUES (1,0)")
 
     conn.commit(); conn.close()
+
 
 
 # ----------------------                                                              
@@ -991,6 +1088,7 @@ try:
     init_db()
     ensure_user_columns()
     ensure_auth_tables()  # make sure refresh_tokens exists
+    ensure_schema_migrations()   # <--- add this call    
     ensure_wallet_tables()   # <-- add this if missing
     print("[hh] Database initialized ✅")
 except Exception as e:
