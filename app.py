@@ -18,274 +18,237 @@ import re, json, logging
 from werkzeug.exceptions import HTTPException
 from passlib.hash import pbkdf2_sha256
 
-# ==== Cross-DB adapter (SQLite or Postgres) ===================================
+
+# =======================
+# Cross-DB adapter (Postgres or SQLite) — single source of truth
+# =======================
 import os, sqlite3
+from datetime import datetime
 from urllib.parse import urlparse
 
-DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///db.sqlite3")
-IS_PG = DATABASE_URL.startswith("postgres://") or DATABASE_URL.startswith("postgresql://")
+DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///db.sqlite3").strip()
+IS_PG = DATABASE_URL.startswith(("postgres://", "postgresql://"))
 
+# Optional Postgres import (only when needed)
 if IS_PG:
-    import psycopg2, psycopg2.extras
-
-class _PgConnAdapter:
-    """Adapter that mimics sqlite3.Connection API enough for the app."""
-    def __init__(self, conn):
-        self._conn = conn
-    def execute(self, sql, params=()):
-        cur = self._conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-        cur.execute(sql, params)
-        return cur
-    def cursor(self):
-        return self._conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-    def commit(self): self._conn.commit()
-    def rollback(self): self._conn.rollback()
-    def close(self): self._conn.close()
+    try:
+        import psycopg2, psycopg2.extras
+    except Exception as e:
+        print("[db] psycopg2 not available. Add `psycopg2-binary` to requirements.txt. Error:", e)
+        raise
 
 def get_db():
+    """
+    Return a connection object with a consistent interface on both engines:
+      - conn.cursor() -> cursor
+      - cursor.execute(sql, params)
+      - cursor.fetchone() / .fetchall() -> dict-like rows
+      - conn.commit(), conn.rollback(), conn.close()
+    """
     if IS_PG:
-        # Railway Postgres usually needs SSL
+        # Railway Postgres (require SSL)
         conn = psycopg2.connect(DATABASE_URL, sslmode="require")
         conn.autocommit = False
-        return _PgConnAdapter(conn)
-    # SQLite fallback (local dev)
-    db_file = DATABASE_URL.replace("sqlite:///", "")
-    conn = sqlite3.connect(db_file)
-    conn.row_factory = sqlite3.Row
-    return conn
-# ==============================================================================
+        # Wrap to always return RealDictCursor cursors (dict rows)
+        class _PgConn:
+            def __init__(self, c): self._c = c
+            def cursor(self): return self._c.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+            def commit(self): self._c.commit()
+            def rollback(self): self._c.rollback()
+            def close(self): self._c.close()
+            # convenience parity with sqlite3.Connection.execute(...)
+            def execute(self, sql, params=()):
+                cur = self.cursor()
+                cur.execute(sql, params)
+                return cur
+        return _PgConn(conn)
 
-
-# --- SQLite helper for Termux/mobile ---
-import sqlite3
-DB_PATH = os.getenv("DATABASE_URL", "db.sqlite3")
-# normalize common forms like sqlite:///db.sqlite3
-if DB_PATH.startswith("sqlite:///"):
-    DB_PATH = DB_PATH[len("sqlite:///"):]
-if DB_PATH.startswith("file:"):
-    DB_PATH = DB_PATH[len("file:"):]
-
-def get_db():
-    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
-    conn.row_factory = sqlite3.Row
+    # SQLite (dev / Termux)
+    db_path = DATABASE_URL.replace("sqlite:///", "")
+    conn = sqlite3.connect(db_path, check_same_thread=False)
+    conn.row_factory = sqlite3.Row  # dict-like rows
     return conn
 
-# ✅ Ensure users table and columns exist before app starts
-def ensure_user_columns():
-    conn = get_db()
-    cur = conn.cursor()
 
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS users(
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            name TEXT,
-            mobile TEXT UNIQUE,
-            email TEXT,
-            address TEXT,
-            password_hash TEXT,
-            verification_code TEXT,
-            verify_expires INTEGER,
-            is_verified INTEGER DEFAULT 0,
-            is_banned INTEGER DEFAULT 0,
-            balance REAL DEFAULT 0,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-    """)
-
-    # Add any missing columns defensively
-    cur.execute("PRAGMA table_info(users)")
-    have = {row["name"] for row in cur.fetchall()}
-
-    wanted = {
-        "name": "TEXT",
-        "mobile": "TEXT",
-        "email": "TEXT",
-        "address": "TEXT",
-        "password_hash": "TEXT",
-        "verification_code": "TEXT",
-        "verify_expires": "INTEGER",                 # OTP expiry (epoch seconds)
-        "is_verified": "INTEGER DEFAULT 0",
-        "is_banned": "INTEGER DEFAULT 0",
-        "balance": "REAL DEFAULT 0",
-        "created_at": "TIMESTAMP DEFAULT CURRENT_TIMESTAMP",
-    }
-    for col, typ in wanted.items():
-        if col not in have:
-            cur.execute(f"ALTER TABLE users ADD COLUMN {col} {typ}")
-
-    conn.commit()
-    conn.close()
-
-def ensure_auth_tables():
-    """Create refresh token table and indexes if missing (idempotent)."""
-    conn = get_db()
-    cur = conn.cursor()
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS refresh_tokens(
-            jti TEXT PRIMARY KEY,
-            user_id INTEGER NOT NULL,
-            issued_at INTEGER NOT NULL,
-            expires_at INTEGER NOT NULL,
-            revoked INTEGER NOT NULL DEFAULT 0,
-            FOREIGN KEY(user_id) REFERENCES users(id)
-        )
-    """)
-    cur.execute("CREATE INDEX IF NOT EXISTS idx_refresh_user ON refresh_tokens(user_id)")
-    cur.execute("CREATE INDEX IF NOT EXISTS idx_refresh_exp  ON refresh_tokens(expires_at)")
-    cur.execute("CREATE INDEX IF NOT EXISTS idx_refresh_rev  ON refresh_tokens(revoked)")
-    conn.commit()
-    conn.close()
-
-def ensure_schema_migrations():
-    db = get_db()
-    cur = db.cursor()
-
-    # ---- users: add missing columns ----
-    cur.execute("PRAGMA table_info(users)")
-    cols = {r[1] for r in cur.fetchall()}
-    if "email" not in cols:
-        cur.execute("ALTER TABLE users ADD COLUMN email TEXT")
-    if "address" not in cols:
-        cur.execute("ALTER TABLE users ADD COLUMN address TEXT")
-    if "locked_balance" not in cols:
-        cur.execute("ALTER TABLE users ADD COLUMN locked_balance REAL DEFAULT 0")
-    if "is_verified" not in cols:
-        cur.execute("ALTER TABLE users ADD COLUMN is_verified INTEGER DEFAULT 0")
-    if "is_banned" not in cols:
-        cur.execute("ALTER TABLE users ADD COLUMN is_banned INTEGER DEFAULT 0")
-
-    # ---- wallet_txns (immutable ledger) ----
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS wallet_txns (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        user_id INTEGER NOT NULL,
-        kind TEXT NOT NULL,
-        amount REAL NOT NULL,
-        balance_after REAL NOT NULL,
-        locked_after REAL NOT NULL,
-        status TEXT NOT NULL,
-        ref TEXT,
-        note TEXT,
-        meta TEXT,
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-        FOREIGN KEY(user_id) REFERENCES users(id)
-    )""")
-
-    # ---- withdrawal_requests ----
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS withdrawal_requests(
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        user_id INTEGER NOT NULL,
-        amount REAL NOT NULL,
-        net_amount REAL NOT NULL,
-        fee_amount REAL NOT NULL,
-        upi TEXT,
-        payout_id TEXT,
-        status TEXT NOT NULL DEFAULT 'requested',
-        reason TEXT,
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-        updated_at TIMESTAMP,
-        FOREIGN KEY(user_id) REFERENCES users(id)
-    )""")
-
-    # ---- fee_pool: migrate old -> new single 'balance' column ----
-    # detect current fee_pool shape
-    cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='fee_pool'")
-    has_fee = cur.fetchone() is not None
-    if not has_fee:
+# ---------- Schema ensure (idempotent) ----------
+def ensure_live_schema_pg():
+    db = get_db(); cur = db.cursor()
+    try:
         cur.execute("""
-        CREATE TABLE fee_pool (
-            id INTEGER PRIMARY KEY CHECK (id=1),
-            balance REAL NOT NULL DEFAULT 0,
-            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        CREATE TABLE IF NOT EXISTS users (
+          id               SERIAL PRIMARY KEY,
+          name             TEXT,
+          mobile           TEXT UNIQUE,
+          email            TEXT,
+          address          TEXT,
+          password_hash    TEXT,
+          verification_code TEXT,
+          verify_expires   BIGINT,
+          is_verified      INTEGER DEFAULT 0,
+          is_banned        INTEGER DEFAULT 0,
+          balance          NUMERIC(12,2) DEFAULT 0,
+          locked_balance   NUMERIC(12,2) DEFAULT 0,
+          created_at       TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )""")
-        cur.execute("INSERT OR IGNORE INTO fee_pool (id, balance) VALUES (1, 0)")
+
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS refresh_tokens(
+          jti        TEXT PRIMARY KEY,
+          user_id    INTEGER NOT NULL REFERENCES users(id),
+          issued_at  BIGINT NOT NULL,
+          expires_at BIGINT NOT NULL,
+          revoked    INTEGER NOT NULL DEFAULT 0
+        )""")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_refresh_user ON refresh_tokens(user_id)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_refresh_exp  ON refresh_tokens(expires_at)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_refresh_rev  ON refresh_tokens(revoked)")
+
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS wallet_txns (
+          id             SERIAL PRIMARY KEY,
+          user_id        INTEGER NOT NULL REFERENCES users(id),
+          kind           TEXT NOT NULL,
+          amount         NUMERIC(12,2) NOT NULL,
+          balance_after  NUMERIC(12,2) NOT NULL,
+          locked_after   NUMERIC(12,2) NOT NULL,
+          status         TEXT NOT NULL,
+          ref            TEXT,
+          note           TEXT,
+          meta           JSONB,
+          created_at     TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )""")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_txn_user    ON wallet_txns(user_id)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_txn_created ON wallet_txns(created_at)")
+
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS withdrawal_requests(
+          id         SERIAL PRIMARY KEY,
+          user_id    INTEGER NOT NULL REFERENCES users(id),
+          amount     NUMERIC(12,2) NOT NULL,
+          net_amount NUMERIC(12,2) NOT NULL,
+          fee_amount NUMERIC(12,2) NOT NULL,
+          upi        TEXT,
+          payout_id  TEXT,
+          status     TEXT NOT NULL DEFAULT 'requested',
+          reason     TEXT,
+          created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+          updated_at TIMESTAMP
+        )""")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_wreq_user   ON withdrawal_requests(user_id)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_wreq_status ON withdrawal_requests(status)")
+
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS fee_pool (
+          id            INTEGER PRIMARY KEY,
+          pool_balance  NUMERIC(12,2) NOT NULL DEFAULT 0,
+          updated_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )""")
+        cur.execute("INSERT INTO fee_pool (id, pool_balance) VALUES (1,0) ON CONFLICT (id) DO NOTHING")
+
+        db.commit()
+        print("[migrate:pg] ✅ schema ensured")
+    except Exception as e:
+        db.rollback()
+        print("[migrate:pg] ⚠️", e)
+        raise
+    finally:
+        db.close()
+
+
+def ensure_live_schema_sqlite():
+    db = get_db(); cur = db.cursor()
+    try:
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS users(
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          name TEXT,
+          mobile TEXT UNIQUE,
+          email TEXT,
+          address TEXT,
+          password_hash TEXT,
+          verification_code TEXT,
+          verify_expires INTEGER,
+          is_verified INTEGER DEFAULT 0,
+          is_banned  INTEGER DEFAULT 0,
+          balance REAL DEFAULT 0,
+          locked_balance REAL DEFAULT 0,
+          created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )""")
+
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS refresh_tokens(
+          jti TEXT PRIMARY KEY,
+          user_id INTEGER NOT NULL,
+          issued_at INTEGER NOT NULL,
+          expires_at INTEGER NOT NULL,
+          revoked INTEGER NOT NULL DEFAULT 0
+        )""")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_refresh_user ON refresh_tokens(user_id)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_refresh_exp  ON refresh_tokens(expires_at)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_refresh_rev  ON refresh_tokens(revoked)")
+
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS wallet_txns (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          user_id INTEGER NOT NULL,
+          kind TEXT NOT NULL,
+          amount REAL NOT NULL,
+          balance_after REAL NOT NULL,
+          locked_after REAL NOT NULL,
+          status TEXT NOT NULL,
+          ref TEXT,
+          note TEXT,
+          meta TEXT,
+          created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )""")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_txn_user    ON wallet_txns(user_id)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_txn_created ON wallet_txns(created_at)")
+
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS withdrawal_requests(
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          user_id INTEGER NOT NULL,
+          amount REAL NOT NULL,
+          net_amount REAL NOT NULL,
+          fee_amount REAL NOT NULL,
+          upi TEXT,
+          payout_id TEXT,
+          status TEXT NOT NULL DEFAULT 'requested',
+          reason TEXT,
+          created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+          updated_at TIMESTAMP
+        )""")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_wreq_user   ON withdrawal_requests(user_id)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_wreq_status ON withdrawal_requests(status)")
+
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS fee_pool (
+          id INTEGER PRIMARY KEY CHECK (id=1),
+          pool_balance REAL NOT NULL DEFAULT 0,
+          updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )""")
+        cur.execute("INSERT OR IGNORE INTO fee_pool (id, pool_balance) VALUES (1, 0)")
+
+        db.commit()
+        print("[migrate:sqlite] ✅ schema ensured")
+    except Exception as e:
+        db.rollback()
+        print("[migrate:sqlite] ⚠️", e)
+        raise
+    finally:
+        db.close()
+
+
+# Run the right migrator on startup (once)
+try:
+    if IS_PG:
+        ensure_live_schema_pg()
     else:
-        cur.execute("PRAGMA table_info(fee_pool)")
-        fcols = {r[1] for r in cur.fetchall()}
-        if {"charity_balance", "maintenance_balance"}.issubset(fcols) and "balance" not in fcols:
-            # read old totals
-            cur.execute("SELECT COALESCE(charity_balance,0), COALESCE(maintenance_balance,0) FROM fee_pool WHERE id=1")
-            row = cur.fetchone()
-            total = float((row[0] if row else 0) + (row[1] if row else 0))
-            # migrate: create new table, copy total, drop old
-            cur.execute("ALTER TABLE fee_pool RENAME TO fee_pool_old")
-            cur.execute("""
-            CREATE TABLE fee_pool (
-                id INTEGER PRIMARY KEY CHECK (id=1),
-                balance REAL NOT NULL DEFAULT 0,
-                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )""")
-            cur.execute("INSERT OR REPLACE INTO fee_pool (id, balance) VALUES (1, ?)", (total,))
-            cur.execute("DROP TABLE fee_pool_old")
-        elif "balance" not in fcols:
-            # unexpected shape -> recreate safely with zero
-            cur.execute("DROP TABLE IF EXISTS fee_pool")
-            cur.execute("""
-            CREATE TABLE fee_pool (
-                id INTEGER PRIMARY KEY CHECK (id=1),
-                balance REAL NOT NULL DEFAULT 0,
-                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )""")
-            cur.execute("INSERT OR IGNORE INTO fee_pool (id, balance) VALUES (1, 0)")
+        ensure_live_schema_sqlite()
+except Exception as e:
+    print("[migrate] init warning:", e)
 
-    db.commit()
-    db.close()
-
-# --- Wallet schema (single pooled fee) ---
-def ensure_wallet_tables():
-    conn = get_db(); cur = conn.cursor()
-
-    # users.locked_balance if missing
-    cur.execute("PRAGMA table_info(users)")
-    have = {r["name"] for r in cur.fetchall()}
-    if "locked_balance" not in have:
-        cur.execute("ALTER TABLE users ADD COLUMN locked_balance REAL DEFAULT 0")
-
-    # immutable ledger
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS wallet_txns (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        user_id INTEGER NOT NULL,
-        kind TEXT NOT NULL,        -- deposit|earn|withdraw_lock|withdraw_settle|withdraw_release|fee_pool|p2p_out|p2p_in
-        amount REAL NOT NULL,      -- +credit/-debit from user's perspective
-        balance_after REAL NOT NULL,
-        locked_after REAL NOT NULL,
-        status TEXT NOT NULL,      -- requested|success|failed|rejected
-        ref TEXT,
-        note TEXT,
-        meta TEXT,
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-        FOREIGN KEY(user_id) REFERENCES users(id)
-    )""")
-
-    # withdrawal requests
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS withdrawal_requests(
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        user_id INTEGER NOT NULL,
-        amount REAL NOT NULL,       -- gross amount user requested
-        net_amount REAL NOT NULL,   -- amount paid to user after fee
-        fee_amount REAL NOT NULL,   -- total 8% fee (goes to pool)
-        upi TEXT,
-        payout_id TEXT,
-        status TEXT NOT NULL DEFAULT 'requested',  -- requested|processing|paid|failed
-        reason TEXT,
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-        updated_at TIMESTAMP,
-        FOREIGN KEY(user_id) REFERENCES users(id)
-    )""")
-
-    # single pooled fee bucket
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS fee_pool (
-        id INTEGER PRIMARY KEY CHECK (id=1),
-        pool_balance REAL NOT NULL DEFAULT 0,
-        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-    )""")
-    cur.execute("INSERT OR IGNORE INTO fee_pool (id,pool_balance) VALUES (1,0)")
-
-    conn.commit(); conn.close()
+print(f"[db] engine={'postgres' if IS_PG else 'sqlite'} url={DATABASE_URL.split('@')[-1][:48]}…")
 
 
 
@@ -1651,12 +1614,10 @@ def version():
     sha = os.getenv("RAILWAY_GIT_COMMIT_SHA") or os.getenv("COMMIT_SHA", "dev")
     return jsonify({"commit": sha}), 200
 
-@app.route("/debug/whichdb", methods=["GET"])
+@app.get("/debug/whichdb")
 def debug_whichdb():
-    info = {}
     if IS_PG:
-        info["engine"] = "postgres"
-        info["url"] = DATABASE_URL[:60] + "..." if DATABASE_URL else None
+        info = {"engine": "postgres", "url_prefix": DATABASE_URL[:25] + "..."}
         try:
             db = get_db()
             row = db.execute("SELECT version() AS v").fetchone()
@@ -1664,11 +1625,26 @@ def debug_whichdb():
             db.close()
         except Exception as e:
             info["error"] = str(e)
+        return jsonify(info)
     else:
         db_file = DATABASE_URL.replace("sqlite:///", "")
-        info = {"engine":"sqlite", "db_file": db_file, "exists": os.path.exists(db_file)}
-    return jsonify(info)
+        return jsonify({"engine":"sqlite","db_file":db_file,"exists":os.path.exists(db_file)})
 
+@app.get("/debug/whichdb")
+def debug_whichdb():
+    if IS_PG:
+        info = {"engine": "postgres", "url_prefix": DATABASE_URL[:25] + "..."}
+        try:
+            db = get_db()
+            row = db.execute("SELECT version() AS v").fetchone()
+            info["version"] = row["v"] if row else None
+            db.close()
+        except Exception as e:
+            info["error"] = str(e)
+        return jsonify(info)
+    else:
+        db_file = DATABASE_URL.replace("sqlite:///", "")
+        return jsonify({"engine":"sqlite","db_file":db_file,"exists":os.path.exists(db_file)})
 
 
 # ----------------------
