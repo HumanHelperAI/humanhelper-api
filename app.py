@@ -195,6 +195,81 @@ def ensure_schema_migrations():
     db.commit()
     db.close()
 
+# ===== SQLite live migrations (safe/idempotent) =====
+def _have_col(cur, table, col):
+    cur.execute(f"PRAGMA table_info({table})")
+    return any(r[1] == col for r in cur.fetchall())
+
+def ensure_live_schema():
+    db = get_db()
+    cur = db.cursor()
+    try:
+        # --- users columns (older DBs may miss these) ---
+        if not _have_col(cur, "users", "email"):
+            cur.execute("ALTER TABLE users ADD COLUMN email TEXT")
+        if not _have_col(cur, "users", "address"):
+            cur.execute("ALTER TABLE users ADD COLUMN address TEXT")
+        if not _have_col(cur, "users", "is_banned"):
+            cur.execute("ALTER TABLE users ADD COLUMN is_banned INTEGER DEFAULT 0")
+        if not _have_col(cur, "users", "balance"):
+            cur.execute("ALTER TABLE users ADD COLUMN balance REAL DEFAULT 0")
+        if not _have_col(cur, "users", "locked_balance"):
+            cur.execute("ALTER TABLE users ADD COLUMN locked_balance REAL DEFAULT 0")
+
+        # --- fee_pool table/columns (unified pool) ---
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS fee_pool (
+                id INTEGER PRIMARY KEY CHECK (id=1),
+                pool_balance REAL NOT NULL DEFAULT 0,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        if not _have_col(cur, "fee_pool", "pool_balance"):
+            cur.execute("ALTER TABLE fee_pool ADD COLUMN pool_balance REAL NOT NULL DEFAULT 0")
+        if not _have_col(cur, "fee_pool", "updated_at"):
+            cur.execute("ALTER TABLE fee_pool ADD COLUMN updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP")
+        # seed single row
+        cur.execute("INSERT OR IGNORE INTO fee_pool (id, pool_balance) VALUES (1, 0)")
+
+        db.commit()
+    except Exception as e:
+        db.rollback()
+        app.logger.warning("[migrate] live schema update warning: %s", e)
+    finally:
+        db.close()
+
+# call this very early in startup (right after init_db / ensure_auth_tables)
+try:
+    ensure_live_schema()
+except Exception as _e:
+    app.logger.warning("[hh] Database init warning: %s", _e)
+
+# ---- admin endpoints to inspect/trigger again ----
+admin_bp = Blueprint("admin", __name__, url_prefix="/admin")
+
+@admin_bp.get("/db/inspect")
+@admin_required
+def admin_db_inspect():
+    db = get_db(); cur = db.cursor()
+    def cols(t):
+        cur.execute(f"PRAGMA table_info({t})")
+        return [r[1] for r in cur.fetchall()]
+    info = {
+        "users_cols": cols("users"),
+        "fee_pool_cols": cols("fee_pool"),
+    }
+    row = db.execute("SELECT id, pool_balance, updated_at FROM fee_pool WHERE id=1").fetchone()
+    if row:
+        info["fee_pool_row"] = dict(row)
+    db.close()
+    return jsonify(info)
+
+@admin_bp.post("/db/migrate")
+@admin_required
+def admin_db_migrate():
+    ensure_live_schema()
+    return jsonify({"ok": True, "message": "schema checked/updated"})
+
 # --- Wallet schema (single pooled fee) ---
 def ensure_wallet_tables():
     conn = get_db(); cur = conn.cursor()
@@ -1088,6 +1163,7 @@ try:
     init_db()
     ensure_user_columns()
     ensure_auth_tables()  # make sure refresh_tokens exists
+    ensure_live_schema() 
     ensure_schema_migrations()   # <--- add this call    
     ensure_wallet_tables()   # <-- add this if missing
     print("[hh] Database initialized ✅")
