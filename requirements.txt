@@ -10,6 +10,7 @@ gunicorn==21.2.0
 # --- Database & ORM ---
 SQLAlchemy==2.0.43
 greenlet==3.2.4
+psycopg2-binary==2.9.9
 
 # --- Auth, Security & Password Hashing ---
 passlib==1.7.4
@@ -20,7 +21,6 @@ python-dotenv==1.0.1
 requests==2.32.5
 typing_extensions==4.12.2
 packaging==24.1
-psycopg2-binary==2.9.9
 
 # --- CLI & Output Formatting ---
 rich==13.9.4
