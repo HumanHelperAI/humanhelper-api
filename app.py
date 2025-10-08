@@ -1630,21 +1630,6 @@ def debug_whichdb():
         db_file = DATABASE_URL.replace("sqlite:///", "")
         return jsonify({"engine":"sqlite","db_file":db_file,"exists":os.path.exists(db_file)})
 
-@app.get("/debug/whichdb")
-def debug_whichdb():
-    if IS_PG:
-        info = {"engine": "postgres", "url_prefix": DATABASE_URL[:25] + "..."}
-        try:
-            db = get_db()
-            row = db.execute("SELECT version() AS v").fetchone()
-            info["version"] = row["v"] if row else None
-            db.close()
-        except Exception as e:
-            info["error"] = str(e)
-        return jsonify(info)
-    else:
-        db_file = DATABASE_URL.replace("sqlite:///", "")
-        return jsonify({"engine":"sqlite","db_file":db_file,"exists":os.path.exists(db_file)})
 
 
 # ----------------------
