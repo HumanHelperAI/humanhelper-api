@@ -195,81 +195,6 @@ def ensure_schema_migrations():
     db.commit()
     db.close()
 
-# ===== SQLite live migrations (safe/idempotent) =====
-def _have_col(cur, table, col):
-    cur.execute(f"PRAGMA table_info({table})")
-    return any(r[1] == col for r in cur.fetchall())
-
-def ensure_live_schema():
-    db = get_db()
-    cur = db.cursor()
-    try:
-        # --- users columns (older DBs may miss these) ---
-        if not _have_col(cur, "users", "email"):
-            cur.execute("ALTER TABLE users ADD COLUMN email TEXT")
-        if not _have_col(cur, "users", "address"):
-            cur.execute("ALTER TABLE users ADD COLUMN address TEXT")
-        if not _have_col(cur, "users", "is_banned"):
-            cur.execute("ALTER TABLE users ADD COLUMN is_banned INTEGER DEFAULT 0")
-        if not _have_col(cur, "users", "balance"):
-            cur.execute("ALTER TABLE users ADD COLUMN balance REAL DEFAULT 0")
-        if not _have_col(cur, "users", "locked_balance"):
-            cur.execute("ALTER TABLE users ADD COLUMN locked_balance REAL DEFAULT 0")
-
-        # --- fee_pool table/columns (unified pool) ---
-        cur.execute("""
-            CREATE TABLE IF NOT EXISTS fee_pool (
-                id INTEGER PRIMARY KEY CHECK (id=1),
-                pool_balance REAL NOT NULL DEFAULT 0,
-                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-        """)
-        if not _have_col(cur, "fee_pool", "pool_balance"):
-            cur.execute("ALTER TABLE fee_pool ADD COLUMN pool_balance REAL NOT NULL DEFAULT 0")
-        if not _have_col(cur, "fee_pool", "updated_at"):
-            cur.execute("ALTER TABLE fee_pool ADD COLUMN updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP")
-        # seed single row
-        cur.execute("INSERT OR IGNORE INTO fee_pool (id, pool_balance) VALUES (1, 0)")
-
-        db.commit()
-    except Exception as e:
-        db.rollback()
-        app.logger.warning("[migrate] live schema update warning: %s", e)
-    finally:
-        db.close()
-
-# call this very early in startup (right after init_db / ensure_auth_tables)
-try:
-    ensure_live_schema()
-except Exception as _e:
-    app.logger.warning("[hh] Database init warning: %s", _e)
-
-# ---- admin endpoints to inspect/trigger again ----
-admin_bp = Blueprint("admin", __name__, url_prefix="/admin")
-
-@admin_bp.get("/db/inspect")
-@admin_required
-def admin_db_inspect():
-    db = get_db(); cur = db.cursor()
-    def cols(t):
-        cur.execute(f"PRAGMA table_info({t})")
-        return [r[1] for r in cur.fetchall()]
-    info = {
-        "users_cols": cols("users"),
-        "fee_pool_cols": cols("fee_pool"),
-    }
-    row = db.execute("SELECT id, pool_balance, updated_at FROM fee_pool WHERE id=1").fetchone()
-    if row:
-        info["fee_pool_row"] = dict(row)
-    db.close()
-    return jsonify(info)
-
-@admin_bp.post("/db/migrate")
-@admin_required
-def admin_db_migrate():
-    ensure_live_schema()
-    return jsonify({"ok": True, "message": "schema checked/updated"})
-
 # --- Wallet schema (single pooled fee) ---
 def ensure_wallet_tables():
     conn = get_db(); cur = conn.cursor()
@@ -400,48 +325,59 @@ except Exception:
         db.close()
         return rows
 
-MIN_WITHDRAW = 100.0          # ₹100
-FEE_RATE = 0.08               # 8%
-FEE_SPLIT = (0.5, 0.5)        # 50/50 => charity, maintenance
+# =========================
+# SAFE MIGRATION HANDLER
+# =========================
 
-def _fetch_user(uid: int):
+def _have_col(cur, table, col):
+    cur.execute(f"PRAGMA table_info({table})")
+    return any(r[1] == col for r in cur.fetchall())
+
+def ensure_live_schema():
     db = get_db()
-    row = db.execute("SELECT id,balance,locked_balance,is_verified,is_banned FROM users WHERE id=?", (uid,)).fetchone()
-    db.close()
-    return row
+    cur = db.cursor()
+    try:
+        # only run if 'users' table exists
+        cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='users'")
+        if cur.fetchone():
+            if not _have_col(cur, "users", "email"):
+                cur.execute("ALTER TABLE users ADD COLUMN email TEXT")
+            if not _have_col(cur, "users", "address"):
+                cur.execute("ALTER TABLE users ADD COLUMN address TEXT")
+            if not _have_col(cur, "users", "is_banned"):
+                cur.execute("ALTER TABLE users ADD COLUMN is_banned INTEGER DEFAULT 0")
+            if not _have_col(cur, "users", "balance"):
+                cur.execute("ALTER TABLE users ADD COLUMN balance REAL DEFAULT 0")
+            if not _have_col(cur, "users", "locked_balance"):
+                cur.execute("ALTER TABLE users ADD COLUMN locked_balance REAL DEFAULT 0")
 
-def _insert_ledger(
-    db, user_id: int, kind: str, delta_amount: float,
-    balance_after: float, locked_after: float,
-    status: str, ref: str | None = None, note: str | None = None, meta: dict | None = None
-):
-    db.execute("""
-        INSERT INTO wallet_txns (
-            user_id, kind, amount, balance_after, locked_after, status, ref, note, meta
-        ) VALUES (?,?,?,?,?,?,?,?,?)
-    """, (user_id, kind, delta_amount, balance_after, locked_after, status, ref, note,
-          json.dumps(meta) if meta is not None else None))
+        # create fee_pool table if not exists
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS fee_pool (
+                id INTEGER PRIMARY KEY CHECK (id=1),
+                pool_balance REAL NOT NULL DEFAULT 0,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        if not _have_col(cur, "fee_pool", "pool_balance"):
+            cur.execute("ALTER TABLE fee_pool ADD COLUMN pool_balance REAL DEFAULT 0")
+        if not _have_col(cur, "fee_pool", "updated_at"):
+            cur.execute("ALTER TABLE fee_pool ADD COLUMN updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP")
 
-def _calc_fee(amount: float) -> tuple[float,float,float]:
-    """Returns (fee_total, fee_charity, fee_maint)."""
-    fee = round(amount * FEE_RATE, 2)
-    ch = round(fee * FEE_SPLIT[0], 2)
-    mt = round(fee - ch, 2)
-    return fee, ch, mt
+        cur.execute("INSERT OR IGNORE INTO fee_pool (id, pool_balance) VALUES (1, 0)")
+        db.commit()
+        print("[migrate] ✅ Live schema check complete")
+    except Exception as e:
+        print("[migrate] ⚠️ Live schema update warning:", e)
+        db.rollback()
+    finally:
+        db.close()
 
-def _upi_validate(s: str) -> bool:
-    s = (s or "").strip()
-    # simple UPI validation: letters/digits/.-_ + @ + handle
-    return bool(re.match(r"^[a-zA-Z0-9.\-_]{2,}@[a-zA-Z]{2,}$", s))
-
-def _qr_payload_for_user(user_id: int) -> str:
-    # You can display this string as QR on frontend; payer scans & posts to /wallet/transfer with receiver_id
-    return f"hhpay:user:{user_id}"
-
-def cleanup_old_logs():
-        # nothing to do for SQLite demo
-        pass
-
+# ✅ CALL AFTER init_db() and ensure_auth_tables()
+try:
+    ensure_live_schema()
+except Exception as e:
+    print("[migrate] init warning:", e)
 
 
 # =========================                                                                                                      
@@ -453,66 +389,70 @@ admin_bp = Blueprint("admin", __name__, url_prefix="/admin")
 def admin_required(fn):
     @wraps(fn)
     def _wrap(*a, **k):
-        token = request.headers.get("X-Admin-Token", "")
-        if not token or token != os.getenv("ADMIN_TOKEN", "changeme"):
+        token = (request.headers.get("X-Admin-Token") or "").strip()
+        if token != os.getenv("ADMIN_TOKEN", "changeme"):
             return jsonify({"ok": False, "error": {"code": "forbidden", "message": "admin auth failed"}}), 403
         return fn(*a, **k)
     return _wrap
 
-
-# ----- Fee pool (read-only dashboard) -----
+# --- Fee pool: unified balance ---
 @admin_bp.get("/wallet/fees")
 @admin_required
 def admin_fees_read():
     db = get_db()
-    row = db.execute("SELECT charity_balance, maintenance_balance, updated_at FROM fee_pool WHERE id=1").fetchone()
+    row = db.execute(
+        "SELECT pool_balance, updated_at FROM fee_pool WHERE id=1"
+    ).fetchone()
     db.close()
     if not row:
         return jsonify({"ok": False, "error": {"code": "not_found", "message": "fee pool not initialized"}}), 404
     return jsonify({
         "ok": True,
-        "charity": float(row["charity_balance"]),
-        "maintenance": float(row["maintenance_balance"]),
-        "updated_at": row["updated_at"]
+        "pool_balance": float(row["pool_balance"] or 0),
+        "updated_at": row["updated_at"],
     })
 
-
-# ----- Fee pool transfer (optional) -----
-# Use this to periodically clear fee_pool into your accounting system.
 @admin_bp.post("/wallet/fees/transfer")
 @admin_required
 def admin_fees_transfer():
+    """Move money out of the unified pool (e.g., to bank/charity acct outside app). JSON: {amount, note}"""
     d = request.get_json(silent=True) or {}
-    from_pool = (d.get("from") or "").strip().lower()          # "charity" or "maintenance"
-    amount = float(d.get("amount") or 0)
-    note = (d.get("note") or "").strip()
+    amount = d.get("amount")
+    note   = (d.get("note") or "").strip()
 
-    if from_pool not in ("charity", "maintenance"):
-        return jsonify({"ok": False, "error": {"code": "bad_request", "message": "from must be charity|maintenance"}}), 400
-    if amount <= 0:
-        return jsonify({"ok": False, "error": {"code": "bad_request", "message": "amount must be > 0"}}), 400
+    try:
+        amount = round(float(amount), 2)
+        if amount <= 0:
+            raise ValueError
+    except Exception:
+        return jsonify({"ok": False, "error": {"code": "bad_request", "message": "invalid amount"}}), 400
 
-    col = "charity_balance" if from_pool == "charity" else "maintenance_balance"
     db = get_db(); cur = db.cursor()
     try:
         db.execute("BEGIN IMMEDIATE")
-        r = cur.execute(f"SELECT {col} FROM fee_pool WHERE id=1").fetchone()
-        if not r or float(r[0]) < amount:
+        row = cur.execute("SELECT pool_balance FROM fee_pool WHERE id=1").fetchone()
+        if not row:
+            raise ValueError("fee pool not initialized")
+        bal = float(row["pool_balance"] or 0)
+        if bal < amount:
             raise ValueError("insufficient pool balance")
-        # reduce pool
-        cur.execute(f"UPDATE fee_pool SET {col} = {col} - ?, updated_at=CURRENT_TIMESTAMP WHERE id=1", (amount,))
-        # audit it into a synthetic admin ledger row (user_id=0)
+
+        cur.execute("""
+            UPDATE fee_pool
+            SET pool_balance = pool_balance - ?, updated_at = CURRENT_TIMESTAMP
+            WHERE id=1
+        """, (amount,))
+        # Optional: record an admin ledger entry to wallet_txns with user_id=0
         cur.execute("""
             INSERT INTO wallet_txns (user_id, kind, amount, balance_after, locked_after, status, ref, note, meta)
-            VALUES (0, ?, ?, 0, 0, 'success', ?, ?, ?)
-        """, (f"fee_transfer_{from_pool}", -amount, f"FEEPOOL:{from_pool}", note, json.dumps({"by": "admin"})))
+            VALUES (0, 'fee_payout', ?, 0, 0, 'success', 'FEEPOOL', ?, ?)
+        """, (-amount, note or "fee pool transfer", json.dumps({"admin": True, "amount": amount})))
         db.commit()
     except Exception as e:
         db.rollback(); db.close()
-        return jsonify({"ok": False, "error": {"code": "failed", "message": str(e)}}), 400
+        return jsonify({"ok": False, "error": {"code": "bad_request", "message": str(e)}}), 400
     db.close()
-    return jsonify({"ok": True, "message": f"transferred {amount} from {from_pool} pool"})
-
+    return jsonify({"ok": True, "message": "transfer recorded", "amount": amount})
 
 # ----- List users (search) -----
 @admin_bp.get("/users")
