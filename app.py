@@ -1,78 +1,134 @@
 #!/usr/bin/env python3
 # app.py - consolidated HumanHelper backend (all-in-one, defensive)
 
+# stdlib
 import os
 import time
 import json
 import random
 import threading
-from typing import Tuple, Optional, Any, Dict, List
+import logging
+import re
+import uuid
+from datetime import datetime, timedelta, timezone
 from functools import wraps
+from typing import Tuple, Optional, Any, Dict, List
 
+# third-party
 import requests
 from flask import Flask, request, jsonify, Blueprint, g
-import jwt, secrets, uuid
-from datetime import datetime, timedelta, timezone
 from flask_cors import CORS
-import re, json, logging 
-from werkzeug.exceptions import HTTPException
+import jwt
 from passlib.hash import pbkdf2_sha256
+from werkzeug.exceptions import HTTPException
 
-
-# =======================
-# Cross-DB adapter (Postgres or SQLite) — single source of truth
-# =======================
-import os, sqlite3
-from datetime import datetime
+# DB helpers (sqlite always available; psycopg2 imported only when using Postgres)
+import sqlite3
 from urllib.parse import urlparse
 
-DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///db.sqlite3").strip()
-IS_PG = DATABASE_URL.startswith(("postgres://", "postgresql://"))
+# Basic logger so import-time messages are visible
+logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
+logger = logging.getLogger("humanhelper")
 
-# Optional Postgres import (only when needed)
+# -----------------------
+# DATABASE_URL handling
+# -----------------------
+DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///db.sqlite3") or "sqlite:///db.sqlite3"
+DATABASE_URL = DATABASE_URL.strip()
+
+# Normalize the old `postgres://` scheme (some libraries expect `postgresql://`)
+if DATABASE_URL.startswith("postgres://"):
+    DATABASE_URL = "postgresql://" + DATABASE_URL[len("postgres://"):]
+
+# Detect engine
+IS_PG = DATABASE_URL.startswith(("postgresql://", "postgres://"))
+
+# Optional: tidy sqlite path form if you ever use it directly
+if DATABASE_URL.startswith("sqlite:///"):
+    SQLITE_PATH = DATABASE_URL[len("sqlite:///"):]
+else:
+    SQLITE_PATH = None
+
+# Try to import psycopg2 only when we intend to use PG
 if IS_PG:
     try:
-        import psycopg2, psycopg2.extras
-    except Exception as e:
-        print("[db] psycopg2 not available. Add `psycopg2-binary` to requirements.txt. Error:", e)
-        raise
+        import psycopg2
+        import psycopg2.extras
+        logger.info("[db] psycopg2 available; Postgres support enabled ✅")
+    except Exception as exc:
+        # Keep IS_PG=False so runtime falls back to sqlite in this environment,
+        # but log a clear message so you know why Postgres won't be used.
+        logger.warning("[db] psycopg2 import failed — Postgres disabled. Install psycopg2-binary in requirements.txt. Error: %s", exc)
+        IS_PG = False
+
 
 def get_db():
     """
     Return a connection object with a consistent interface on both engines:
-      - conn.cursor() -> cursor
-      - cursor.execute(sql, params)
-      - cursor.fetchone() / .fetchall() -> dict-like rows
-      - conn.commit(), conn.rollback(), conn.close()
+    - conn.cursor() -> cursor
+    - cursor.execute(sql, params)
+    - cursor.fetchone() / .fetchall() -> dict-like rows
+    - conn.commit(), conn.rollback(), conn.close()
     """
     if IS_PG:
         # Railway Postgres (require SSL)
         conn = psycopg2.connect(DATABASE_URL, sslmode="require")
         conn.autocommit = False
+
         # Wrap to always return RealDictCursor cursors (dict rows)
         class _PgConn:
-            def __init__(self, c): self._c = c
-            def cursor(self): return self._c.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-            def commit(self): self._c.commit()
-            def rollback(self): self._c.rollback()
-            def close(self): self._c.close()
+            def __init__(self, c):
+                self._c = c
+
+            def cursor(self):
+                return self._c.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+
+            def commit(self):
+                self._c.commit()
+
+            def rollback(self):
+                self._c.rollback()
+
+            def close(self):
+                self._c.close()
+
             # convenience parity with sqlite3.Connection.execute(...)
             def execute(self, sql, params=()):
                 cur = self.cursor()
                 cur.execute(sql, params)
                 return cur
+
         return _PgConn(conn)
 
-    # SQLite (dev / Termux)
+    # SQLite (dev / Termux) fallback
     db_path = DATABASE_URL.replace("sqlite:///", "")
     conn = sqlite3.connect(db_path, check_same_thread=False)
     conn.row_factory = sqlite3.Row  # dict-like rows
     return conn
 
 
+# ---- Local dev safety: stub any missing helpers ----
+def _noop(*a, **k):
+    pass
+
+
+for _name in [
+    "ensure_live_schema",
+    "ensure_user_columns",
+    "ensure_auth_tables",
+    "ensure_schema_migrations",
+    "ensure_wallet_tables",
+    "cleanup_old_logs",
+]:
+    if _name not in globals():
+        globals()[_name] = _noop
+
+
 # ---------- Schema ensure (idempotent) ----------
 def ensure_live_schema_pg():
-    db = get_db(); cur = db.cursor()
+    """Create/upgrade tables in Postgres. Safe to run repeatedly."""
+    db = get_db()
+    cur = db.cursor()
     try:
         cur.execute("""
         CREATE TABLE IF NOT EXISTS users (
@@ -89,8 +145,8 @@ def ensure_live_schema_pg():
           balance          NUMERIC(12,2) DEFAULT 0,
           locked_balance   NUMERIC(12,2) DEFAULT 0,
           created_at       TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )""")
-
+        )
+        """)
         cur.execute("""
         CREATE TABLE IF NOT EXISTS refresh_tokens(
           jti        TEXT PRIMARY KEY,
@@ -98,7 +154,8 @@ def ensure_live_schema_pg():
           issued_at  BIGINT NOT NULL,
           expires_at BIGINT NOT NULL,
           revoked    INTEGER NOT NULL DEFAULT 0
-        )""")
+        )
+        """)
         cur.execute("CREATE INDEX IF NOT EXISTS idx_refresh_user ON refresh_tokens(user_id)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_refresh_exp  ON refresh_tokens(expires_at)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_refresh_rev  ON refresh_tokens(revoked)")
@@ -116,7 +173,8 @@ def ensure_live_schema_pg():
           note           TEXT,
           meta           JSONB,
           created_at     TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )""")
+        )
+        """)
         cur.execute("CREATE INDEX IF NOT EXISTS idx_txn_user    ON wallet_txns(user_id)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_txn_created ON wallet_txns(created_at)")
 
@@ -125,15 +183,18 @@ def ensure_live_schema_pg():
           id         SERIAL PRIMARY KEY,
           user_id    INTEGER NOT NULL REFERENCES users(id),
           amount     NUMERIC(12,2) NOT NULL,
-          net_amount NUMERIC(12,2) NOT NULL,
-          fee_amount NUMERIC(12,2) NOT NULL,
+          net_amount NUMERIC(12,2),
+          fee_amount NUMERIC(12,2),
           upi        TEXT,
           payout_id  TEXT,
           status     TEXT NOT NULL DEFAULT 'requested',
           reason     TEXT,
+          method     TEXT,
+          account    TEXT,
           created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
           updated_at TIMESTAMP
-        )""")
+        )
+        """)
         cur.execute("CREATE INDEX IF NOT EXISTS idx_wreq_user   ON withdrawal_requests(user_id)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_wreq_status ON withdrawal_requests(status)")
 
@@ -142,7 +203,8 @@ def ensure_live_schema_pg():
           id            INTEGER PRIMARY KEY,
           pool_balance  NUMERIC(12,2) NOT NULL DEFAULT 0,
           updated_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )""")
+        )
+        """)
         cur.execute("INSERT INTO fee_pool (id, pool_balance) VALUES (1,0) ON CONFLICT (id) DO NOTHING")
 
         db.commit()
@@ -156,7 +218,9 @@ def ensure_live_schema_pg():
 
 
 def ensure_live_schema_sqlite():
-    db = get_db(); cur = db.cursor()
+    """Create/upgrade tables in SQLite. Safe to run repeatedly."""
+    db = get_db()
+    cur = db.cursor()
     try:
         cur.execute("""
         CREATE TABLE IF NOT EXISTS users(
@@ -173,8 +237,8 @@ def ensure_live_schema_sqlite():
           balance REAL DEFAULT 0,
           locked_balance REAL DEFAULT 0,
           created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )""")
-
+        )
+        """)
         cur.execute("""
         CREATE TABLE IF NOT EXISTS refresh_tokens(
           jti TEXT PRIMARY KEY,
@@ -182,7 +246,8 @@ def ensure_live_schema_sqlite():
           issued_at INTEGER NOT NULL,
           expires_at INTEGER NOT NULL,
           revoked INTEGER NOT NULL DEFAULT 0
-        )""")
+        )
+        """)
         cur.execute("CREATE INDEX IF NOT EXISTS idx_refresh_user ON refresh_tokens(user_id)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_refresh_exp  ON refresh_tokens(expires_at)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_refresh_rev  ON refresh_tokens(revoked)")
@@ -200,7 +265,8 @@ def ensure_live_schema_sqlite():
           note TEXT,
           meta TEXT,
           created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )""")
+        )
+        """)
         cur.execute("CREATE INDEX IF NOT EXISTS idx_txn_user    ON wallet_txns(user_id)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_txn_created ON wallet_txns(created_at)")
 
@@ -209,15 +275,18 @@ def ensure_live_schema_sqlite():
           id INTEGER PRIMARY KEY AUTOINCREMENT,
           user_id INTEGER NOT NULL,
           amount REAL NOT NULL,
-          net_amount REAL NOT NULL,
-          fee_amount REAL NOT NULL,
+          net_amount REAL,
+          fee_amount REAL,
           upi TEXT,
           payout_id TEXT,
           status TEXT NOT NULL DEFAULT 'requested',
           reason TEXT,
+          method TEXT,
+          account TEXT,
           created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
           updated_at TIMESTAMP
-        )""")
+        )
+        """)
         cur.execute("CREATE INDEX IF NOT EXISTS idx_wreq_user   ON withdrawal_requests(user_id)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_wreq_status ON withdrawal_requests(status)")
 
@@ -226,7 +295,8 @@ def ensure_live_schema_sqlite():
           id INTEGER PRIMARY KEY CHECK (id=1),
           pool_balance REAL NOT NULL DEFAULT 0,
           updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )""")
+        )
+        """)
         cur.execute("INSERT OR IGNORE INTO fee_pool (id, pool_balance) VALUES (1, 0)")
 
         db.commit()
@@ -248,38 +318,66 @@ try:
 except Exception as e:
     print("[migrate] init warning:", e)
 
+
 print(f"[db] engine={'postgres' if IS_PG else 'sqlite'} url={DATABASE_URL.split('@')[-1][:48]}…")
 
 
-
-# ---- Cross-DB SQL helpers ----                                                                       
+# ---- Cross-DB SQL helpers ----
 def _fix_placeholders(sql: str) -> str:
-    # convert SQLite "?" params to Postgres "%s" (outside quotes only)
-    if not IS_PG: 
+    """
+    Convert SQLite-style '?' params to Postgres '%s' placeholders.
+    Only replaces ? characters that are outside of single/double quotes.
+    """
+    if not IS_PG:
         return sql
-    out, in_q = [], False
-    for ch in sql:
-        if ch in ("'", '"'):
-            in_q = not in_q
+
+    out = []
+    in_single = False
+    in_double = False
+    i = 0
+    while i < len(sql):
+        ch = sql[i]
+        if ch == "'" and not in_double:
+            in_single = not in_single
             out.append(ch)
-        elif ch == "?" and not in_q:
+        elif ch == '"' and not in_single:
+            in_double = not in_double
+            out.append(ch)
+        elif ch == "?" and not in_single and not in_double:
             out.append("%s")
         else:
             out.append(ch)
+        i += 1
     return "".join(out)
 
+
 def execq(db, sql: str, params: tuple = ()):
+    """Execute a query on the given db connection with placeholder fixing."""
     return db.execute(_fix_placeholders(sql), params)
 
+
 def insert_ret_id(db, sql: str, params: tuple = ()) -> int:
+    """
+    Run an insert and return the inserted id in a DB-agnostic way.
+    For Postgres we append RETURNING id when missing.
+    For SQLite we return lastrowid or 0.
+    """
     sql2 = _fix_placeholders(sql)
-    if IS_PG and "returning" not in sql2.lower():
-        sql2 = sql2.rstrip() + " RETURNING id"
+    if IS_PG:
+        if "returning" not in sql2.lower():
+            sql2 = sql2.rstrip("; ") + " RETURNING id"
         cur = db.execute(sql2, params)
         row = cur.fetchone()
+        # psycopg RealDictCursor returns a dict-like row
         return int(row["id"] if isinstance(row, dict) else row[0])
-    cur = db.execute(sql2, params)
-    return int(getattr(cur, "lastrowid", 0) or 0)
+    else:
+        cur = db.execute(sql2, params)
+        # sqlite3 cursor: use lastrowid on the connection's cursor object
+        try:
+            return int(getattr(cur, "lastrowid", 0) or 0)
+        except Exception:
+            return 0
+
 
 
 # ----------------------                                                              
@@ -290,7 +388,6 @@ from flask_limiter.util import get_remote_address
 from flask_limiter.errors import RateLimitExceeded
 
 app = Flask(__name__)
-
 app.url_map.strict_slashes = False
 
 # Use REDIS_URL if present, else fallback to in-memory (dev)
@@ -315,12 +412,17 @@ limiter = Limiter(
 
 @app.errorhandler(RateLimitExceeded)
 def ratelimit_handler(e):
-    return jsonify({"ok": False, "error": {"code":"rate_limited","message":"Too many requests. Try later."}}), 429
-
+    return jsonify({
+        "ok": False,
+        "error": {
+            "code": "rate_limited",
+            "message": "Too many requests. Try later."
+        }
+    }), 429
 
 
 # ----------------------
-# Fallback DB helpers (if `database` module not present)                                                                          
+# Fallback DB helpers (if `database` module not present)
 # ----------------------
 try:
     from database import init_db, run_query, cleanup_old_logs
@@ -331,17 +433,17 @@ except Exception:
         db = get_db()
         cur = db.cursor()
         cur.execute("""
-            CREATE TABLE IF NOT EXISTS users (
-              id INTEGER PRIMARY KEY AUTOINCREMENT,
-              name TEXT,
-              mobile TEXT UNIQUE,
-              password_hash TEXT,
-              email TEXT,
-              address TEXT,
-              is_banned INTEGER DEFAULT 0,
-              balance REAL DEFAULT 0,
-              created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
+        CREATE TABLE IF NOT EXISTS users (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT,
+            mobile TEXT UNIQUE,
+            password_hash TEXT,
+            email TEXT,
+            address TEXT,
+            is_banned INTEGER DEFAULT 0,
+            balance REAL DEFAULT 0,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
         """)
         db.commit()
         db.close()
@@ -354,6 +456,7 @@ except Exception:
         db.commit()
         db.close()
         return rows
+
 
 
 # =========================
@@ -375,30 +478,31 @@ def _col_exists(cur, table: str, col: str) -> bool:
 # ---------- AUTO MIGRATION (Postgres) ----------
 def ensure_live_schema_pg():
     """Create/upgrade tables for Postgres. Safe to run repeatedly."""
-    db = get_db(); cur = db.cursor()
+    db = get_db()
+    cur = db.cursor()
     try:
         # users
         execq(db, """
         CREATE TABLE IF NOT EXISTS users (
-          id              SERIAL PRIMARY KEY,
-          name            TEXT,
-          mobile          TEXT UNIQUE,
-          password_hash   TEXT,
-          email           TEXT,
-          address         TEXT,
-          is_verified     INTEGER DEFAULT 0,
-          is_banned       INTEGER DEFAULT 0,
-          balance         NUMERIC(12,2) DEFAULT 0,
-          locked_balance  NUMERIC(12,2) DEFAULT 0,
-          verification_code TEXT,
-          verify_expires  BIGINT,
-          created_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            id              SERIAL PRIMARY KEY,
+            name            TEXT,
+            mobile          TEXT UNIQUE,
+            password_hash   TEXT,
+            email           TEXT,
+            address         TEXT,
+            is_verified     INTEGER DEFAULT 0,
+            is_banned       INTEGER DEFAULT 0,
+            balance         NUMERIC(12,2) DEFAULT 0,
+            locked_balance  NUMERIC(12,2) DEFAULT 0,
+            verification_code TEXT,
+            verify_expires  BIGINT,
+            created_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
         """)
         execq(db, "ALTER TABLE users ADD COLUMN IF NOT EXISTS email TEXT")
         execq(db, "ALTER TABLE users ADD COLUMN IF NOT EXISTS address TEXT")
         execq(db, "ALTER TABLE users ADD COLUMN IF NOT EXISTS is_verified INTEGER DEFAULT 0")
-        execq(db, "ALTER TABLE users ADD COLUMN IF NOT EXISTS is_banned  INTEGER DEFAULT 0")
+        execq(db, "ALTER TABLE users ADD COLUMN IF NOT EXISTS is_banned INTEGER DEFAULT 0")
         execq(db, "ALTER TABLE users ADD COLUMN IF NOT EXISTS balance NUMERIC(12,2) DEFAULT 0")
         execq(db, "ALTER TABLE users ADD COLUMN IF NOT EXISTS locked_balance NUMERIC(12,2) DEFAULT 0")
         execq(db, "ALTER TABLE users ADD COLUMN IF NOT EXISTS verification_code TEXT")
@@ -407,11 +511,11 @@ def ensure_live_schema_pg():
         # refresh_tokens
         execq(db, """
         CREATE TABLE IF NOT EXISTS refresh_tokens(
-          jti        TEXT PRIMARY KEY,
-          user_id    INTEGER NOT NULL REFERENCES users(id),
-          issued_at  BIGINT NOT NULL,
-          expires_at BIGINT NOT NULL,
-          revoked    INTEGER NOT NULL DEFAULT 0
+            jti        TEXT PRIMARY KEY,
+            user_id    INTEGER NOT NULL REFERENCES users(id),
+            issued_at  BIGINT NOT NULL,
+            expires_at BIGINT NOT NULL,
+            revoked    INTEGER NOT NULL DEFAULT 0
         )
         """)
         execq(db, "CREATE INDEX IF NOT EXISTS idx_refresh_user ON refresh_tokens(user_id)")
@@ -421,17 +525,17 @@ def ensure_live_schema_pg():
         # wallet_txns
         execq(db, """
         CREATE TABLE IF NOT EXISTS wallet_txns (
-          id             SERIAL PRIMARY KEY,
-          user_id        INTEGER NOT NULL REFERENCES users(id),
-          kind           TEXT NOT NULL,
-          amount         NUMERIC(12,2) NOT NULL,
-          balance_after  NUMERIC(12,2) NOT NULL,
-          locked_after   NUMERIC(12,2) NOT NULL,
-          status         TEXT NOT NULL,
-          ref            TEXT,
-          note           TEXT,
-          meta           JSONB,
-          created_at     TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            id             SERIAL PRIMARY KEY,
+            user_id        INTEGER NOT NULL REFERENCES users(id),
+            kind           TEXT NOT NULL,
+            amount         NUMERIC(12,2) NOT NULL,
+            balance_after  NUMERIC(12,2) NOT NULL,
+            locked_after   NUMERIC(12,2) NOT NULL,
+            status         TEXT NOT NULL,
+            ref            TEXT,
+            note           TEXT,
+            meta           JSONB,
+            created_at     TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
         """)
         execq(db, "CREATE INDEX IF NOT EXISTS idx_txn_user    ON wallet_txns(user_id)")
@@ -440,19 +544,19 @@ def ensure_live_schema_pg():
         # withdrawal_requests
         execq(db, """
         CREATE TABLE IF NOT EXISTS withdrawal_requests(
-          id         SERIAL PRIMARY KEY,
-          user_id    INTEGER NOT NULL REFERENCES users(id),
-          amount     NUMERIC(12,2) NOT NULL,
-          net_amount NUMERIC(12,2),
-          fee_amount NUMERIC(12,2),
-          upi        TEXT,
-          payout_id  TEXT,
-          status     TEXT NOT NULL DEFAULT 'requested',
-          reason     TEXT,
-          method     TEXT,
-          account    TEXT,
-          created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-          updated_at TIMESTAMP
+            id         SERIAL PRIMARY KEY,
+            user_id    INTEGER NOT NULL REFERENCES users(id),
+            amount     NUMERIC(12,2) NOT NULL,
+            net_amount NUMERIC(12,2),
+            fee_amount NUMERIC(12,2),
+            upi        TEXT,
+            payout_id  TEXT,
+            status     TEXT NOT NULL DEFAULT 'requested',
+            reason     TEXT,
+            method     TEXT,
+            account    TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP
         )
         """)
         execq(db, "CREATE INDEX IF NOT EXISTS idx_wreq_user   ON withdrawal_requests(user_id)")
@@ -461,9 +565,9 @@ def ensure_live_schema_pg():
         # fee_pool (single bucket)
         execq(db, """
         CREATE TABLE IF NOT EXISTS fee_pool (
-          id           INTEGER PRIMARY KEY,
-          pool_balance NUMERIC(12,2) NOT NULL DEFAULT 0,
-          updated_at   TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            id           INTEGER PRIMARY KEY,
+            pool_balance NUMERIC(12,2) NOT NULL DEFAULT 0,
+            updated_at   TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
         """)
         execq(db, "INSERT INTO fee_pool (id, pool_balance) VALUES (1,0) ON CONFLICT (id) DO NOTHING")
@@ -489,27 +593,30 @@ except Exception as e:
 
 # Heal on the next request if a schema error pops up
 def _repair_fee_pool():
-    db = get_db(); cur = db.cursor()
+    db = get_db()
+    cur = db.cursor()
     try:
         if IS_PG:
             execq(db, """
             CREATE TABLE IF NOT EXISTS fee_pool (
-              id           INTEGER PRIMARY KEY,
-              pool_balance NUMERIC(12,2) NOT NULL DEFAULT 0,
-              updated_at   TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                id           INTEGER PRIMARY KEY,
+                pool_balance NUMERIC(12,2) NOT NULL DEFAULT 0,
+                updated_at   TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )""")
             execq(db, "INSERT INTO fee_pool (id, pool_balance) VALUES (1,0) ON CONFLICT (id) DO NOTHING")
         else:
-            execq(db, """
+            # SQLite path
+            cur.execute("""
             CREATE TABLE IF NOT EXISTS fee_pool (
-              id INTEGER PRIMARY KEY CHECK (id=1),
-              pool_balance REAL NOT NULL DEFAULT 0,
-              updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                id INTEGER PRIMARY KEY CHECK (id=1),
+                pool_balance REAL NOT NULL DEFAULT 0,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )""")
-            execq(db, "INSERT OR IGNORE INTO fee_pool (id, pool_balance) VALUES (1,0)")
+            cur.execute("INSERT OR IGNORE INTO fee_pool (id, pool_balance) VALUES (1,0)")
         db.commit()
     except Exception:
-        db.rollback(); raise
+        db.rollback()
+        raise
     finally:
         db.close()
 
@@ -519,14 +626,36 @@ AUTO_SCHEMA_PATTERNS = (
     "no such column",
     "has no column",
     "unknown column",
-    "relation \"" ,               # PG: relation "table" does not exist
+    'relation "',          # PG: relation "table" does not exist
     "does not exist",
-    "column "                     # PG: column xyz does not exist
+    "column "
 )
 
 def _maybe_fix_schema_from_error(e: Exception):
     msg = (str(e) or "").lower()
-    if any(p in msg for p in AUTO_SCHEMA_PATTERNS):
+    try:
+        if any(p in msg for p in AUTO_SCHEMA_PATTERNS):
+            if IS_PG:
+                ensure_live_schema_pg()
+            else:
+                ensure_live_schema()
+    except Exception:
+        # swallow in auto-fix; original handler will still respond
+        pass
+
+# When SQLite schema errors bubble up, auto-fix for next request
+if not IS_PG:
+    @app.errorhandler(sqlite3.OperationalError)
+    def _sqlite_op_error(e):
+        _maybe_fix_schema_from_error(e)
+        # Return a clean JSON; next request will usually succeed
+        return jsonify({"ok": False, "error": {"code": "internal_error", "message": "Internal server error"}}), 500
+
+# Also run occasionally to keep things tidy
+@app.before_request
+def _bg_schema_tick():
+    # tiny chance to re-check on live traffic
+    if random.randint(1, 200) == 1:
         try:
             if IS_PG:
                 ensure_live_schema_pg()
@@ -535,21 +664,28 @@ def _maybe_fix_schema_from_error(e: Exception):
         except Exception:
             pass
 
-# Also run occasionally to keep things tidy
-@app.before_request
-def _bg_schema_tick():
-    # tiny chance to re-check on live traffic
-    if random.randint(1, 200) == 1:
-        try: ensure_live_schema()
-        except Exception: pass
 
 
 
-# =========================                                                                                                      
+# ------------------------
+# Small helper: unify param style between sqlite and psycopg2
+# ------------------------
+def db_exec(cur, sql: str, params: tuple = ()):
+    """Execute SQL using the correct placeholder style for the active DB.
+    Use '?' in the SQL here (sqlite style) and this helper will convert to '%s'
+    for psycopg2 when IS_PG is True.
+    """
+    if IS_PG:
+        # convert sqlite-style placeholders (?) to psycopg2 (%s)
+        sql = sql.replace("?", "%s")
+    return cur.execute(sql, params)
+
+# =========================
 # ADMIN BLUEPRINT + ROUTES
 # =========================
 
 admin_bp = Blueprint("admin", __name__, url_prefix="/admin")
+
 
 def admin_required(fn):
     @wraps(fn)
@@ -560,14 +696,15 @@ def admin_required(fn):
         return fn(*a, **k)
     return _wrap
 
+
 @admin_bp.get("/wallet/fees")
 @admin_required
 def admin_fees_read():
     db = get_db()
     try:
         row = db.execute("SELECT pool_balance, updated_at FROM fee_pool WHERE id=1").fetchone()
-    except sqlite3.OperationalError as e:
-        # Try to fix schema automatically if pool_balance is missing
+    except Exception as e:
+        # Try to fix schema automatically if pool_balance is missing or table doesn't exist
         db.close()
         _ = admin_fix_fee_pool()
         db = get_db()
@@ -577,12 +714,13 @@ def admin_fees_read():
         return jsonify({"ok": False, "error": {"code": "not_found", "message": "fee pool not initialized"}}), 404
     return jsonify({"ok": True, "pool_balance": float(row["pool_balance"]), "updated_at": row["updated_at"]})
 
+
 @admin_bp.post("/wallet/fees/transfer")
 @admin_required
 def admin_fees_transfer():
     """
     Decrease the shared fee pool by `amount` (for charity/ops payouts, etc.).
-    Works on both SQLite and Postgres via execq()/placeholder shim.
+    Works on both SQLite and Postgres via db_exec() placeholder shim.
     """
     d = request.get_json(silent=True) or {}
     try:
@@ -594,12 +732,11 @@ def admin_fees_transfer():
     if amt <= 0:
         return jsonify({"ok": False, "error": {"code": "bad_request", "message": "amount must be > 0"}}), 400
 
-    db = get_db()
+    db = get_db(); cur = db.cursor()
     try:
-        # start tx (sqlite accepts "BEGIN", pg treats as BEGIN)
-        execq(db, "BEGIN")
-
-        row = execq(db, "SELECT pool_balance FROM fee_pool WHERE id=1").fetchone()
+        # start tx
+        db.execute("BEGIN")
+        row = db_exec(cur, "SELECT pool_balance FROM fee_pool WHERE id=1").fetchone()
         bal = float(row["pool_balance"] if row else 0.0)
 
         if bal < amt:
@@ -609,17 +746,21 @@ def admin_fees_transfer():
                 "error": {"code": "insufficient", "message": "insufficient pool balance"}
             }), 400
 
-        execq(db, """
+        db_exec(cur, """
             UPDATE fee_pool
-               SET pool_balance = pool_balance - ?, 
-                   updated_at   = CURRENT_TIMESTAMP
-             WHERE id = 1
+            SET pool_balance = pool_balance - ?,
+                updated_at   = CURRENT_TIMESTAMP
+            WHERE id = 1
         """, (amt,))
 
         db.commit()
     except Exception as e:
-        db.rollback(); db.close()
-        _maybe_fix_schema_from_error(e)   # harmless no-op on PG if you implemented it that way
+        try:
+            db.rollback()
+        except Exception:
+            pass
+        db.close()
+        _maybe_fix_schema_from_error(e)
         return jsonify({"ok": False, "error": {"code": "internal_error", "message": str(e)}}), 500
 
     db.close()
@@ -668,9 +809,10 @@ def admin_user_ban():
     if not mobile:
         return jsonify({"ok": False, "error": {"code": "bad_request", "message": "mobile required"}}), 400
     db = get_db(); cur = db.cursor()
-    cur.execute("UPDATE users SET is_banned=1 WHERE mobile=?", (mobile,))
+    db_exec(cur, "UPDATE users SET is_banned=1 WHERE mobile=?", (mobile,))
     db.commit(); db.close()
     return jsonify({"ok": True, "message": f"user {mobile} banned"})
+
 
 @admin_bp.post("/user/unban")
 @admin_required
@@ -680,7 +822,7 @@ def admin_user_unban():
     if not mobile:
         return jsonify({"ok": False, "error": {"code": "bad_request", "message": "mobile required"}}), 400
     db = get_db(); cur = db.cursor()
-    cur.execute("UPDATE users SET is_banned=0 WHERE mobile=?", (mobile,))
+    db_exec(cur, "UPDATE users SET is_banned=0 WHERE mobile=?", (mobile,))
     db.commit(); db.close()
     return jsonify({"ok": True, "message": f"user {mobile} unbanned"})
 
@@ -718,7 +860,7 @@ def admin_user_txns(uid: int):
 @admin_bp.get("/withdrawals")
 @admin_required
 def admin_withdrawals_list():
-    status = (request.args.get("status") or "").strip().lower()  # requested|processing|paid|failed (optional)
+    status = (request.args.get("status") or "").strip().lower()
     limit = min(max(int(request.args.get("limit", 50)), 1), 200)
     offset = max(int(request.args.get("offset", 0)), 0)
 
@@ -765,11 +907,12 @@ def admin_adjust_balance():
 
     db = get_db()
     cur = db.cursor()
-    cur.execute("UPDATE users SET balance = balance + ? WHERE id=?", (delta, user_id))
+    db_exec(cur, "UPDATE users SET balance = balance + ? WHERE id=?", (delta, user_id))
     db.commit()
     db.close()
 
     return jsonify({"ok": True, "message": f"Adjusted ₹{delta} for user {user_id}", "note": note})
+
 
 @admin_bp.post("/db/fix/fee-pool")
 @admin_required
@@ -786,7 +929,7 @@ def admin_fix_fee_pool():
         db.execute("BEGIN IMMEDIATE")
 
         # ensure table exists
-        cur.execute("""
+        db_exec(cur, """
             CREATE TABLE IF NOT EXISTS fee_pool (
               id INTEGER PRIMARY KEY CHECK (id=1),
               pool_balance REAL NOT NULL DEFAULT 0,
@@ -801,7 +944,6 @@ def admin_fix_fee_pool():
         # add pool_balance if missing
         if "pool_balance" not in cols:
             cur.execute("ALTER TABLE fee_pool ADD COLUMN pool_balance REAL DEFAULT 0")
-            # refresh cols set
             cur.execute("PRAGMA table_info(fee_pool)")
             cols = {r[1] for r in cur.fetchall()}
 
@@ -812,7 +954,6 @@ def admin_fix_fee_pool():
         has_char = "charity_balance" in cols
         has_maint = "maintenance_balance" in cols
         if has_char or has_maint:
-            # try to read them safely; if missing, treat as 0
             try:
                 row = cur.execute(
                     "SELECT "
@@ -825,22 +966,23 @@ def admin_fix_fee_pool():
                 pb = float(row["pb"]) if row and "pb" in row.keys() else 0.0
             except Exception:
                 cb = mb = 0.0
-                # pool_balance is guaranteed after ALTER, read that alone
                 row2 = cur.execute("SELECT pool_balance FROM fee_pool WHERE id=1").fetchone()
                 pb = float(row2["pool_balance"]) if row2 else 0.0
 
             total = round(pb if (pb > 0) else (cb + mb), 2)
-            cur.execute(
-                "UPDATE fee_pool SET pool_balance=?, updated_at=CURRENT_TIMESTAMP WHERE id=1",
-                (total,)
-            )
+            db_exec(cur, "UPDATE fee_pool SET pool_balance=?, updated_at=CURRENT_TIMESTAMP WHERE id=1", (total,))
 
         db.commit()
         db.close()
         return jsonify({"ok": True, "message": "fee_pool repaired"}), 200
     except Exception as e:
-        db.rollback(); db.close()
+        try:
+            db.rollback()
+        except Exception:
+            pass
+        db.close()
         return jsonify({"ok": False, "error": {"code":"internal_error","message": str(e)}}), 500
+
 
 @admin_bp.post("/tools/repair-withdrawals")
 @admin_required
@@ -848,32 +990,36 @@ def admin_repair_withdrawals():
     n = _repair_stuck_withdrawals(max_age_min=0)  # repair immediately
     return jsonify({"ok": True, "released": n})
 
+
 # ✅ Register admin blueprint once (AFTER all routes above are defined)
 app.register_blueprint(admin_bp)
 
 
 
+
 # ----------------------
-# Wallet helpers (module-level)                                                                                                   
+# Wallet helpers (module-level)
 # ----------------------
 def _user_by_id(uid: int):
     db = get_db()
-    row = db.execute(
-        "SELECT id, balance, locked_balance, is_verified, is_banned FROM users WHERE id=?",
-        (uid,)
-    ).fetchone()
+    cur = db.cursor()
+    row = db_exec(cur, "SELECT id, balance, locked_balance, is_verified, is_banned FROM users WHERE id=?", (uid,)).fetchone()
     db.close()
     return row
+
 
 try:
     from writer import start_writer, enqueue_write
 except Exception:
-    def start_writer(): 
+    def start_writer():
         print("[hh] writer.start_writer stub")
+
     def enqueue_write(sql, params=(), timeout=1.0):
         # emulate synchronous success
         return True, None, ["immediate"], 0, None
+
     print("[hh] Warning: writer module not found — using stub enqueue_write")
+
 
 try:
     from wallet import deposit, withdraw
@@ -884,6 +1030,7 @@ except Exception:
         return False, "wallet not configured"
     print("[hh] Warning: wallet module not found — using stubs")
 
+
 try:
     from earnings import reward_user
 except Exception:
@@ -891,8 +1038,9 @@ except Exception:
         return False, "earnings not configured"
     print("[hh] Warning: earnings module not found — using stubs")
 
+
 # -------- Razorpay Payout (UPI only) --------
-uyRAZORPAY_KEY_ID = os.getenv("RAZORPAY_KEY_ID", "")
+RAZORPAY_KEY_ID = os.getenv("RAZORPAY_KEY_ID", "")
 RAZORPAY_KEY_SECRET = os.getenv("RAZORPAY_KEY_SECRET", "")
 RAZORPAY_PAYOUT_URL = "https://api.razorpay.com/v1/payouts"
 
@@ -930,8 +1078,7 @@ def _razorpay_payout_upi(upi_id: str, amount_inr: float, ref: str, timeout: int 
         return False, str(e)
 
 
-
-# ----------------------                                                                                                          
+# ----------------------
 # Config / env
 # ----------------------
 ADMIN_TOKEN = os.getenv("ADMIN_TOKEN", "changeme")
@@ -972,7 +1119,6 @@ LLAMA_TIMEOUT = int(os.getenv("LLAMA_TIMEOUT", DEFAULT_REQ_TIMEOUT))
 FREE_MODELS_PRIORITY = [m.strip() for m in os.getenv("FREE_MODELS_PRIORITY", "").split(",") if m.strip()]
 
 # ==== JWT config & helpers ====================================================
-
 if not FREE_MODELS_PRIORITY:
     FREE_MODELS_PRIORITY = [
         "openrouter:gpt-oss-20b",
@@ -983,18 +1129,23 @@ if not FREE_MODELS_PRIORITY:
         "google:gemini-2.0-flash-exp"
     ]
 
-#++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+def _now() -> int:
+    return int(time.time())
 
-def _now() -> int: return int(time.time())
-def _make_jti() -> str: return uuid.uuid4().hex
+def _make_jti() -> str:
+    return uuid.uuid4().hex
 
 JWT_SECRET = os.getenv("JWT_SECRET", "change-this-in-railway")
 JWT_ALGO   = "HS256"
 ACCESS_TTL_MIN   = int(os.getenv("ACCESS_TTL_MIN", "30"))
 REFRESH_TTL_DAYS = int(os.getenv("REFRESH_TTL_DAYS", "30"))
 
-def _utcnow(): return datetime.now(timezone.utc)
-def _now_ts(): return int(_utcnow().timestamp())
+def _utcnow():
+    return datetime.now(timezone.utc)
+
+def _now_ts():
+    return int(_utcnow().timestamp())
+
 
 def make_access_token(user_id: int, mobile: str) -> str:
     now = _utcnow()
@@ -1009,6 +1160,7 @@ def make_access_token(user_id: int, mobile: str) -> str:
     }
     return jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALGO)
 
+
 def make_refresh_token(user_id: int) -> str:
     now = _utcnow()
     exp = now + timedelta(days=REFRESH_TTL_DAYS)
@@ -1022,13 +1174,15 @@ def make_refresh_token(user_id: int) -> str:
     }
     token = jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALGO)
 
+    # persist refresh token record using db_exec to handle placeholders
     conn = get_db()
-    conn.execute(
-        "INSERT INTO refresh_tokens (jti,user_id,issued_at,expires_at,revoked) VALUES (?,?,?,?,0)",
-        (jti, user_id, int(now.timestamp()), int(exp.timestamp()))
-    )
-    conn.commit(); conn.close()
+    cur = conn.cursor()
+    db_exec(cur, "INSERT INTO refresh_tokens (jti,user_id,issued_at,expires_at,revoked) VALUES (?,?,?,?,0)",
+            (jti, user_id, int(now.timestamp()), int(exp.timestamp())))
+    conn.commit()
+    conn.close()
     return token
+
 
 def decode_token(token: str):
     try:
@@ -1038,34 +1192,39 @@ def decode_token(token: str):
     except jwt.InvalidTokenError:
         return None
 
+
 def auth_required(fn):
     @wraps(fn)
     def _wrap(*a, **k):
         auth = request.headers.get("Authorization", "")
         if not auth.startswith("Bearer "):
-            return jsonify({"error":"missing token"}), 401
-        payload = decode_token(auth.split(" ",1)[1])
+            return jsonify({"error": "missing token"}), 401
+        payload = decode_token(auth.split(" ", 1)[1])
         if not payload or payload.get("type") != "access":
-            return jsonify({"error":"invalid or expired token"}), 401
+            return jsonify({"error": "invalid or expired token"}), 401
         g.user_id = int(payload["sub"])
         g.mobile = payload.get("mobile") or ""
         return fn(*a, **k)
     return _wrap
 
+
 def clean_expired_refresh():
     conn = get_db()
     cur = conn.cursor()
-    cur.execute("DELETE FROM refresh_tokens WHERE expires_at < ?", (_now(),))
+    db_exec(cur, "DELETE FROM refresh_tokens WHERE expires_at < ?", (_now(),))
     conn.commit()
     conn.close()
 # ==== /JWT ====================================================================
 
 
 
+
+
 # ----------------------
-# Utilities: HTTP with retries/backoff                                                                                            
+# Utilities: HTTP with retries/backoff
 # ----------------------
-def _do_request_with_retries(method: str, url: str, headers: Optional[dict] = None, json_body: Optional[dict] = None,
+def _do_request_with_retries(method: str, url: str, headers: Optional[dict] = None,
+                             json_body: Optional[dict] = None,
                              timeout: int = 10, max_attempts: int = 3) -> Tuple[bool, Any]:
     attempt = 0
     backoff_base = 0.5
@@ -1076,32 +1235,37 @@ def _do_request_with_retries(method: str, url: str, headers: Optional[dict] = No
                 r = requests.post(url, headers=headers, json=json_body, timeout=timeout)
             else:
                 r = requests.get(url, headers=headers, params=json_body, timeout=timeout)
+
             # success
             if 200 <= r.status_code < 300:
                 return True, r
+
             # handle common transient statuses
             if r.status_code in (429, 503):
                 # respect Retry-After if present
                 ra = r.headers.get("Retry-After")
                 if ra:
                     try:
-                        time.sleep(float(ra) + random.uniform(0.1,0.6))
+                        time.sleep(float(ra) + random.uniform(0.1, 0.6))
                     except Exception:
-                        time.sleep(backoff_base * (2 ** attempt) + random.uniform(0,0.3))
+                        time.sleep(backoff_base * (2 ** attempt) + random.uniform(0, 0.3))
                 else:
-                    time.sleep(backoff_base * (2 ** attempt) + random.uniform(0,0.3))
+                    time.sleep(backoff_base * (2 ** attempt) + random.uniform(0, 0.3))
                 attempt += 1
                 continue
+
+            # non-transient HTTP error
             return False, r
+
         except requests.exceptions.RequestException as e:
             last_exc = e
-            time.sleep(backoff_base * (2 ** attempt) + random.uniform(0,0.3))
+            time.sleep(backoff_base * (2 ** attempt) + random.uniform(0, 0.3))
             attempt += 1
+
     return False, f"request failed after {max_attempts} attempts: {last_exc}"
 
 
-
-# ----------------------                                                                                                          
+# ----------------------
 # Provider wrappers
 # ----------------------
 def enforce_length(prompt: str, target_words: int | None) -> str:
@@ -1112,6 +1276,7 @@ def enforce_length(prompt: str, target_words: int | None) -> str:
         f"Write **about {target_words} words**. "
         f"Plain paragraph, no lists, no markdown, no code blocks."
     )
+
 
 def _extract_text_like(j: dict) -> str:
     # 1) OpenAI-like
@@ -1136,12 +1301,14 @@ def _extract_text_like(j: dict) -> str:
                         return part["text"].strip()
     except Exception:
         pass
+
     # 2) top-level fallbacks
     for k in ("text", "output", "content", "response"):
         v = j.get(k)
         if isinstance(v, str) and v.strip():
             return v.strip()
     return ""
+
 
 def ask_openrouter(model: str, prompt: str, timeout: int = OPENROUTER_TIMEOUT) -> Tuple[bool, str]:
     if not OPENROUTER_API_KEY or not OPENROUTER_URL:
@@ -1164,7 +1331,7 @@ def ask_openrouter(model: str, prompt: str, timeout: int = OPENROUTER_TIMEOUT) -
         if not text:
             # one quick retry with a tiny instruction to force plain text
             payload2 = dict(payload)
-            payload2["messages"] = [{"role":"user","content": f"{prompt}\n\nRespond with plain text only."}]
+            payload2["messages"] = [{"role": "user", "content": f"{prompt}\n\nRespond with plain text only."}]
             r2 = requests.post(OPENROUTER_URL, headers=headers, json=payload2, timeout=timeout)
             if r2.status_code == 200:
                 text = _extract_text_like(r2.json())
@@ -1172,39 +1339,40 @@ def ask_openrouter(model: str, prompt: str, timeout: int = OPENROUTER_TIMEOUT) -
     except Exception as e:
         return False, f"openrouter parse error: {e}"
 
-# OpenAI REST (generic)
-def ask_openai_rest(prompt: str, timeout: int = OPENAI_TIMEOUT) -> Tuple[bool, str]:  
-    key = OPENAI_API_KEY  
-    if not key:  
-        return False, "openai not configured"  
 
-    headers = {"Authorization": f"Bearer {key}", "Content-Type": "application/json"}  
-    body = {  
-        "model": os.getenv("OPENAI_MODEL", "gpt-4o-mini"),  
-        "messages": [{"role": "user", "content": prompt}],  
-        "max_tokens": int(os.getenv("OPENAI_MAX_TOKENS", "400")),  
-        "temperature": float(os.getenv("OPENAI_TEMPERATURE", "0.3"))  
+# OpenAI REST (generic)
+def ask_openai_rest(prompt: str, timeout: int = OPENAI_TIMEOUT) -> Tuple[bool, str]:
+    key = OPENAI_API_KEY
+    if not key:
+        return False, "openai not configured"
+
+    headers = {"Authorization": f"Bearer {key}", "Content-Type": "application/json"}
+    body = {
+        "model": os.getenv("OPENAI_MODEL", "gpt-4o-mini"),
+        "messages": [{"role": "user", "content": prompt}],
+        "max_tokens": int(os.getenv("OPENAI_MAX_TOKENS", "400")),
+        "temperature": float(os.getenv("OPENAI_TEMPERATURE", "0.3"))
     }
 
-    # ✅ Make sure this line is indented **4 spaces** under the function
     ok, resp = _do_request_with_retries("post", OPENAI_URL, headers=headers, json_body=body, timeout=timeout)
 
-    if not ok:  
-        if isinstance(resp, requests.Response):  
-            return False, f"OpenAI error {resp.status_code}: {resp.text[:800]}"  
-        return False, str(resp)  
+    if not ok:
+        if isinstance(resp, requests.Response):
+            return False, f"OpenAI error {resp.status_code}: {resp.text[:800]}"
+        return False, str(resp)
 
-    try:  
-        j = resp.json()  
-        choices = j.get("choices", [])  
-        if choices:  
-            text = choices[0].get("message", {}).get("content") or choices[0].get("text")  
-            return True, (text or "").strip()  
-        if "error" in j:  
-            return False, json.dumps(j["error"])[:800]  
-        return True, json.dumps(j)[:1000]  
-    except Exception as e:  
+    try:
+        j = resp.json()
+        choices = j.get("choices", [])
+        if choices:
+            text = choices[0].get("message", {}).get("content") or choices[0].get("text")
+            return True, (text or "").strip()
+        if "error" in j:
+            return False, json.dumps(j["error"])[:800]
+        return True, json.dumps(j)[:1000]
+    except Exception as e:
         return False, f"OpenAI parse error: {e}"
+
 
 # DeepSeek wrapper
 def ask_deepseek(prompt: str, timeout: int = DEEPSEEK_TIMEOUT) -> Tuple[bool, str]:
@@ -1214,9 +1382,9 @@ def ask_deepseek(prompt: str, timeout: int = DEEPSEEK_TIMEOUT) -> Tuple[bool, st
     headers = {"Authorization": f"Bearer {key}", "Content-Type": "application/json"}
     payload = {
         "model": os.getenv("DEEPSEEK_MODEL", "deepseek-chat"),
-        "messages": [{"role":"user","content":prompt}],
-        "max_tokens": int(os.getenv("DEEPSEEK_MAX_TOKENS","400")),
-        "temperature": float(os.getenv("DEEPSEEK_TEMPERATURE","0.6"))
+        "messages": [{"role": "user", "content": prompt}],
+        "max_tokens": int(os.getenv("DEEPSEEK_MAX_TOKENS", "400")),
+        "temperature": float(os.getenv("DEEPSEEK_TEMPERATURE", "0.6"))
     }
     ok, resp = _do_request_with_retries("post", DEEPSEEK_URL, headers=headers, json_body=payload, timeout=timeout)
     if not ok:
@@ -1237,14 +1405,15 @@ def ask_deepseek(prompt: str, timeout: int = DEEPSEEK_TIMEOUT) -> Tuple[bool, st
     except Exception as e:
         return False, f"DeepSeek parse error: {e}"
 
+
 # Gemini-free wrapper (REST)
-def gemini_free_chat(prompt: str, timeout: int = 12) -> tuple[bool,str]:
+def gemini_free_chat(prompt: str, timeout: int = 12) -> tuple[bool, str]:
     api_key = os.getenv("GEMINI_API_KEY")
-    base = os.getenv("GEMINI_REST_URL","https://generativelanguage.googleapis.com/v1beta")
-    if not api_key: 
+    base = os.getenv("GEMINI_REST_URL", "https://generativelanguage.googleapis.com/v1beta")
+    if not api_key:
         return False, "gemini not configured"
     url = f"{base}/models/gemini-2.0-flash:generateContent?key={api_key}"
-    body = {"contents":[{"parts":[{"text":prompt}]}]}
+    body = {"contents": [{"parts": [{"text": prompt}]}]}
     try:
         r = requests.post(url, json=body, timeout=timeout)
         if r.status_code != 200:
@@ -1254,8 +1423,10 @@ def gemini_free_chat(prompt: str, timeout: int = 12) -> tuple[bool,str]:
         return True, text.strip()
     except Exception as e:
         return False, f"gemini error: {e}"
+
+
 # LLaMA local server wrapper (assumes simple JSON API)
-def ask_llama(prompt: str, n_predict: int = 256, timeout: int = LLAMA_TIMEOUT) -> Tuple[bool,str]:
+def ask_llama(prompt: str, n_predict: int = 256, timeout: int = LLAMA_TIMEOUT) -> Tuple[bool, str]:
     url = LLAMA_SERVER_URL
     headers = {"Content-Type": "application/json"}
     payload = {"prompt": prompt, "n_predict": int(n_predict)}
@@ -1263,12 +1434,13 @@ def ask_llama(prompt: str, n_predict: int = 256, timeout: int = LLAMA_TIMEOUT) -
         r = requests.post(url, headers=headers, json=payload, timeout=timeout)
     except Exception as e:
         return False, f"llama request exception: {e}"
+
     if r.status_code >= 400:
         return False, f"llama server returned {r.status_code}: {(r.text or '')[:1000]}"
     try:
         j = r.json()
         # try to parse simple shapes
-        for k in ("content","text","result","answer","output","response"):
+        for k in ("content", "text", "result", "answer", "output", "response"):
             v = j.get(k)
             if isinstance(v, str) and v.strip():
                 return True, v.strip()
@@ -1276,7 +1448,7 @@ def ask_llama(prompt: str, n_predict: int = 256, timeout: int = LLAMA_TIMEOUT) -
         if isinstance(choices, list) and choices:
             first = choices[0]
             if isinstance(first, dict):
-                for k in ("text","content","message"):
+                for k in ("text", "content", "message"):
                     v = first.get(k)
                     if isinstance(v, str) and v.strip():
                         return True, v.strip()
@@ -1284,15 +1456,17 @@ def ask_llama(prompt: str, n_predict: int = 256, timeout: int = LLAMA_TIMEOUT) -
     except Exception:
         return True, (r.text or "").strip() or ""
 
+
 # ---------- Clean FREE_MODELS_PRIORITY parsing ----------
 def _split_priority(s: str) -> list[str]:
     # handles stray quotes/whitespace/newlines/commas
-    tokens = []
+    tokens: list[str] = []
     for raw in (s or "").replace("\n", ",").split(","):
         t = raw.strip().strip('"').strip("'")
         if t:
             tokens.append(t)
     return tokens
+
 
 FREE_MODELS_PRIORITY = _split_priority(os.getenv("FREE_MODELS_PRIORITY", ""))
 
@@ -1304,12 +1478,11 @@ if not FREE_MODELS_PRIORITY:
     ]
 
 
-
 # ----------------------
-# FREE_MODELS_PRIORITY format: "<provider>:<model>" e.g. "openrouter:gpt-oss-20b"                                                 
+# FREE_MODELS_PRIORITY format: "<provider>:<model>" e.g. "openrouter:gpt-oss-20b"
 # ----------------------
 def try_free_models_in_order(prompt: str, timeout_each: int = OPENROUTER_TIMEOUT) -> Tuple[bool, str, Optional[str]]:
-    last_errs = []
+    last_errs: list[str] = []
     for token in FREE_MODELS_PRIORITY:
         prov, model = (token.split(":", 1) + [""])[:2]
         prov, model = prov.strip().lower(), model.strip()
@@ -1317,23 +1490,28 @@ def try_free_models_in_order(prompt: str, timeout_each: int = OPENROUTER_TIMEOUT
         try:
             if prov in ("openai", "gpt"):
                 ok, res = ask_openai_rest(prompt, timeout=timeout_each)
-                if ok: return True, res, f"openai/{model or 'default'}"
+                if ok:
+                    return True, res, f"openai/{model or 'default'}"
                 last_errs.append(f"openai:{res}")
 
             elif prov in ("gemini", "google"):
                 ok, res = gemini_free_chat(prompt, timeout=timeout_each)
-                if ok: return True, res, "gemini-free"
+                if ok:
+                    return True, res, "gemini-free"
                 last_errs.append(f"gemini:{res}")
 
             elif prov in ("openrouter", "openrouter.ai"):
-                if not model: model = "openrouter/auto"
+                if not model:
+                    model = "openrouter/auto"
                 ok, res = ask_openrouter(model, prompt, timeout=timeout_each)
-                if ok: return True, res, f"openrouter/{model}"
+                if ok:
+                    return True, res, f"openrouter/{model}"
                 last_errs.append(f"openrouter:{res}")
 
             elif prov == "llama":
                 ok, res = ask_llama(prompt, timeout=timeout_each)
-                if ok: return True, res, "llama"
+                if ok:
+                    return True, res, "llama"
                 last_errs.append(f"llama:{res}")
 
             else:
@@ -1344,19 +1522,30 @@ def try_free_models_in_order(prompt: str, timeout_each: int = OPENROUTER_TIMEOUT
     return False, "; ".join(last_errs[:5]) or "no free provider configured", None
 
 
-
-
 # --- Initialize SQLite DB on startup ---
+# Decide engine once
+DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///db.sqlite3")
+IS_PG = DATABASE_URL.startswith(("postgres://", "postgresql://"))
+
+# ---- boot-time schema ensure ----
 try:
-    init_db()
-    ensure_user_columns()
-    ensure_auth_tables()  # make sure refresh_tokens exists
-    ensure_live_schema() 
-    ensure_schema_migrations()   # <--- add this call    
-    ensure_wallet_tables()   # <-- add this if missing
-    print("[hh] Database initialized ✅")
+    if IS_PG:
+        # Postgres: create/upgrade tables, nothing SQLite-related
+        ensure_live_schema_pg()
+        print("[hh] init_db skipped on PG ✅")
+    else:
+        # SQLite: do local file DB setup
+        init_db()
+        ensure_user_columns()
+        ensure_auth_tables()
+        ensure_live_schema()
+        ensure_schema_migrations()
+        ensure_wallet_tables()
+        print("[hh] Database initialized ✅ (sqlite)")
 except Exception as e:
-    print("[hh] Database init warning:", e)
+    # keep this nonfatal, but message should be engine-aware
+    print("[hh] init_db failed (nonfatal):", e)
+
 
 # Allowed origins for browsers
 ALLOWED_ORIGINS = {
@@ -1370,43 +1559,57 @@ ALLOWED_ORIGINS = {
     "https://humanhelperai.github.io",
 }
 
+import sqlite3 as _sqlite3
+
+if not IS_PG:
+    @app.errorhandler(_sqlite3.OperationalError)
+    def _sqlite_op_error(e):
+        _maybe_fix_schema_from_error(e)
+        return jsonify({"ok": False,
+                        "error": {"code": "internal_error", "message": "Internal server error"}}), 500
+
 # Use ONE CORS strategy. (A) Flask-Cors:
 from flask_cors import CORS
 CORS(app, resources={r"*": {"origins": ALLOWED_ORIGINS}}, supports_credentials=False)
 
 
-
-
-
-# ----------------------                                                                                                          
-# Auth Blueprint
-# ----------------------
+# =======================
+# Auth blueprint + routes
+# =======================
 auth_bp = Blueprint("auth", __name__, url_prefix="/auth")
+
 
 # unified responses
 def ok(payload: dict | None = None, status: int = 200):
     return jsonify({"ok": True, **(payload or {})}), status
 
+
 def err(message: str, status: int = 400, code: str = "bad_request", extra: dict | None = None):
     body = {"ok": False, "error": {"code": code, "message": message}}
-    if extra: body["error"].update(extra)
+    if extra:
+        body["error"].update(extra)
     return jsonify(body), status
 
+
 from werkzeug.exceptions import HTTPException
+
 
 @app.errorhandler(HTTPException)
 def _http_exc(e: HTTPException):
     return err(e.description or "HTTP error", e.code or 500, code=str(e.code))
+
 
 @app.errorhandler(Exception)
 def _uncaught(e: Exception):
     app.logger.exception("uncaught_exception")
     return err("Internal server error", 500, code="internal_error")
 
+
 def _cors_origin(origin: str) -> str | None:
     if not origin:
         return None
     return origin if origin in ALLOWED_ORIGINS else None
+
 
 @app.after_request
 def add_security_headers(resp):
@@ -1417,7 +1620,9 @@ def add_security_headers(resp):
     resp.headers.setdefault("Permissions-Policy", "geolocation=(), microphone=(), camera=()")
     return resp
 
+
 MOBILE_RE = re.compile(r"^\+?[0-9]{8,15}$")
+
 
 def require_fields(data: dict, fields: list[str]):
     missing = [f for f in fields if not (data.get(f) or "").strip()]
@@ -1425,13 +1630,16 @@ def require_fields(data: dict, fields: list[str]):
         return f"Missing fields: {', '.join(missing)}"
     return None
 
+
 def validate_mobile(m: str) -> bool:
     return bool(MOBILE_RE.match(m or ""))
+
 
 # Handle preflight quickly
 @app.route("/<path:anypath>", methods=["OPTIONS"])
 def options_any(anypath):
     return ("", 204)
+
 
 def _repair_stuck_withdrawals(max_age_min: int = 10, batch_limit: int = 50):
     """
@@ -1492,6 +1700,7 @@ def _repair_stuck_withdrawals(max_age_min: int = 10, batch_limit: int = 50):
         _maybe_fix_schema_from_error(e)
         return 0
 
+
 # light background cleanup thread (non-blocking)
 def _cleanup_loop():
     while True:
@@ -1507,45 +1716,273 @@ def _cleanup_loop():
             print("[hh] Cleanup error:", e)
             time.sleep(60)
 
+
+# start background cleanup thread once
 threading.Thread(target=_cleanup_loop, daemon=True).start()
 
-# --- Admin guard ---
+
+# --- Admin guard (kept - separate from admin blueprint decorator) ---
 def admin_required(fn):
     @wraps(fn)
     def _wrap(*a, **k):
         tok = (request.headers.get("X-Admin-Token") or "").strip()
         if not ADMIN_TOKEN:
-            return jsonify({"error":"admin not configured"}), 500
+            return jsonify({"error": "admin not configured"}), 500
         if tok != ADMIN_TOKEN:
-            # tiny debug line you can keep or remove later
             app.logger.warning("admin_required: bad token len=%s", len(tok))
-            return jsonify({"error":"admin auth failed"}), 401
+            return jsonify({"error": "admin auth failed"}), 401
         return fn(*a, **k)
     return _wrap
 
 
+# utilities used by auth
+def _utcnow(): return datetime.now(timezone.utc)
+def _otp(): return f"{random.randint(100000,999999)}"
+
+MOBILE_IN_RE = re.compile(r'^[6-9]\d{9}$')          # India mobile
+EMAIL_RE = re.compile(r'^[^@\s]+@[^@\s]+\.[^@\s]+$')
+OTP_TTL_MIN = int(os.getenv("OTP_TTL_MIN", "10"))
+SEND_VERIFICATION_MODE = os.getenv("SEND_VERIFICATION_MODE", "console")
+
+
+def _send_code(dest: str, code: str):
+    if SEND_VERIFICATION_MODE == "console":
+        print(f"[VERIFY] send code {code} to {dest}")
+
+
+def _clean(s): return (s or "").strip()
+
+
+@auth_bp.post("/register")
+@limiter.limit("10/hour")
+def register():
+    d = request.get_json(silent=True) or {}
+    name = _clean(d.get("full_name"))
+    mobile = _clean(d.get("mobile"))
+    password = d.get("password") or ""
+    email = _clean(d.get("email"))
+    address = _clean(d.get("address"))
+
+    if not name or len(name) < 2:
+        return jsonify({"error": "full_name required"}), 400
+    if not MOBILE_IN_RE.match(mobile):
+        return jsonify({"error": "invalid mobile (India 10-digit)"}), 400
+    if len(password) < 8:
+        return jsonify({"error": "password must be at least 8 chars"}), 400
+    if email and not EMAIL_RE.match(email):
+        return jsonify({"error": "invalid email"}), 400
+    if len(address) < 4:
+        return jsonify({"error": "address required"}), 400
+
+    code = _otp()
+    expires = _now_ts() + OTP_TTL_MIN * 60
+    pwd_hash = pbkdf2_sha256.hash(password)
+
+    db = get_db()
+    cur = db.cursor()
+    row = cur.execute("SELECT id, is_verified FROM users WHERE mobile=?", (mobile,)).fetchone()
+    if row and int(row["is_verified"]) == 1:
+        db.close()
+        return jsonify({"error": "mobile already registered"}), 409
+
+    # Upsert; keep user unverified until OTP verified
+    cur.execute("""
+        INSERT INTO users (name,mobile,email,address,password_hash,verification_code,verify_expires,is_verified)
+        VALUES (?,?,?,?,?,?,?,0)
+        ON CONFLICT(mobile) DO UPDATE SET
+            name=excluded.name,
+            email=excluded.email,
+            address=excluded.address,
+            password_hash=excluded.password_hash,
+            verification_code=excluded.verification_code,
+            verify_expires=excluded.verify_expires,
+            is_verified=0
+    """, (name, mobile, email, address, pwd_hash, code, expires))
+    db.commit()
+    db.close()
+
+    _send_code(mobile, code)
+    return jsonify({"message": "verification code sent", "mobile": mobile, "expires_in_min": OTP_TTL_MIN}), 201
+
+
+@auth_bp.post("/verify")
+@limiter.limit("20/hour")
+def verify():
+    d = request.get_json(silent=True) or {}
+    mobile = _clean(d.get("mobile"))
+    code = _clean(d.get("code"))
+
+    if not MOBILE_IN_RE.match(mobile):
+        return jsonify({"error": "invalid mobile"}), 400
+    if not code.isdigit() or len(code) != 6:
+        return jsonify({"error": "invalid code"}), 400
+
+    db = get_db()
+    row = db.execute("SELECT id,verification_code,verify_expires,is_verified FROM users WHERE mobile=?", (mobile,)).fetchone()
+    if not row:
+        db.close(); return jsonify({"error": "user not found"}), 404
+    if int(row["is_verified"]) == 1:
+        db.close(); return jsonify({"message": "already verified"}), 200
+    if (row["verification_code"] or "") != code:
+        db.close(); return jsonify({"error": "incorrect code"}), 400
+    if row["verify_expires"] and _now_ts() > int(row["verify_expires"]):
+        db.close(); return jsonify({"error": "code expired"}), 400
+
+    db.execute("UPDATE users SET is_verified=1, verification_code=NULL, verify_expires=NULL WHERE id=?", (row["id"],))
+    db.commit(); db.close()
+    return jsonify({"message": "verified"}), 200
+
+
+@auth_bp.post("/resend-code")
+@limiter.limit("5/hour")
+def resend_code():
+    d = request.get_json(silent=True) or {}
+    mobile = _clean(d.get("mobile"))
+    if not MOBILE_IN_RE.match(mobile):
+        return jsonify({"error": "invalid mobile"}), 400
+
+    db = get_db()
+    row = db.execute("SELECT id,is_verified FROM users WHERE mobile=?", (mobile,)).fetchone()
+    if not row:
+        db.close(); return jsonify({"error": "not registered"}), 404
+    if int(row["is_verified"]) == 1:
+        db.close(); return jsonify({"message": "already verified"}), 200
+
+    code = _otp()
+    expires = _now_ts() + OTP_TTL_MIN * 60
+    db.execute("UPDATE users SET verification_code=?, verify_expires=? WHERE id=?", (code, expires, row["id"]))
+    db.commit(); db.close()
+    _send_code(mobile, code)
+    return jsonify({"message": "verification code re-sent", "expires_in_min": OTP_TTL_MIN}), 200
+
+
+@auth_bp.post("/login")
+@limiter.limit("5/minute;50/hour")
+def login():
+    d = request.get_json(silent=True) or {}
+    mobile = _clean(d.get("mobile"))
+    password = d.get("password") or ""
+    if not MOBILE_IN_RE.match(mobile) or not password:
+        return jsonify({"error": "invalid credentials"}), 400
+
+    db = get_db()
+    row = db.execute("SELECT id,is_banned,is_verified,password_hash,name,email,address FROM users WHERE mobile=?", (mobile,)).fetchone()
+    db.close()
+
+    if not row:
+        return jsonify({"error": "user not found"}), 404
+    if row["is_banned"]:
+        return jsonify({"error": "account banned"}), 403
+    if not row["is_verified"]:
+        return jsonify({"error": "not verified"}), 403
+    if not pbkdf2_sha256.verify(password, row["password_hash"]):
+        return jsonify({"error": "invalid credentials"}), 401
+
+    access = make_access_token(row["id"], mobile)
+    refresh = make_refresh_token(row["id"])
+
+    return jsonify({
+        "ok": True,
+        "user": {
+            "id": row["id"], "name": row["name"], "mobile": mobile,
+            "email": row["email"], "address": row["address"]
+        },
+        "access": access,
+        "refresh": refresh
+    }), 200
+
+
+@auth_bp.post("/refresh")
+def refresh():
+    """JSON: { refresh }  -> returns new access + rotated refresh"""
+    data = request.get_json(silent=True) or {}
+    token = (data.get("refresh") or "").strip()
+    payload = decode_token(token)
+    if not payload or payload.get("type") != "refresh":
+        return jsonify({"error": "invalid or expired refresh"}), 401
+
+    jti = payload.get("jti", "")
+    conn = get_db()
+    row = conn.execute("SELECT user_id, revoked, expires_at FROM refresh_tokens WHERE jti=?", (jti,)).fetchone()
+    if (not row) or row["revoked"] or row["expires_at"] < _now_ts():
+        conn.close()
+        return jsonify({"error": "refresh revoked/expired"}), 401
+
+    # rotate: revoke current, issue new
+    conn.execute("UPDATE refresh_tokens SET revoked=1 WHERE jti=?", (jti,))
+    conn.commit()
+
+    # fetch mobile for claim
+    mrow = conn.execute("SELECT mobile FROM users WHERE id=?", (row["user_id"],)).fetchone()
+    conn.close()
+
+    new_access = make_access_token(row["user_id"], mrow["mobile"])
+    new_refresh = make_refresh_token(row["user_id"])
+    return jsonify({"access": new_access, "refresh": new_refresh}), 200
+
+
+@auth_bp.post("/logout")
+def logout():
+    """JSON: { refresh }  -> revoke this refresh token"""
+    data = request.get_json(silent=True) or {}
+    token = (data.get("refresh") or "").strip()
+    payload = decode_token(token)
+    if not payload or payload.get("type") != "refresh":
+        return jsonify({"error": "invalid refresh"}), 400
+    jti = payload.get("jti", "")
+    conn = get_db()
+    conn.execute("UPDATE refresh_tokens SET revoked=1 WHERE jti=?", (jti,))
+    conn.commit()
+    conn.close()
+    return jsonify({"message": "logged out"}), 200
+
+
+@app.before_request
+def _maybe_purge():
+    # ~1% of requests purge old refresh tokens
+    if random.randint(1, 100) == 1:
+        try:
+            clean_expired_refresh()
+        except Exception:
+            pass
+
+
+@app.get("/whoami")
+@auth_required
+def whoami():
+    return jsonify({"user_id": g.user_id, "mobile": g.mobile})
+
+
+# register blueprint once
+app.register_blueprint(auth_bp)
+
+
 # ----------------------
-# Simple utility endpoints                                                                                                       
+# Simple utility endpoints
 # ----------------------
 @app.route("/", methods=["GET"])
 def root():
-    return jsonify({"message":"Human Helper API is live", "status":"ok"}), 200
+    return jsonify({"message": "Human Helper API is live", "status": "ok"}), 200
+
 
 # Optional: don’t rate-limit health checks
 @limiter.exempt
 @app.route("/health", methods=["GET"])
 def health():
-    return jsonify({"message":"Human Helper API is live", "status":"ok"}), 200
+    return jsonify({"message": "Human Helper API is live", "status": "ok"}), 200
+
 
 # ✅ Simple echo test route
 @app.route("/echo", methods=["POST"])
 def echo():
     return jsonify({"you_sent": request.json or {}})
 
+
 @app.route("/version", methods=["GET"])
 def version():
     sha = os.getenv("RAILWAY_GIT_COMMIT_SHA") or os.getenv("COMMIT_SHA", "dev")
     return jsonify({"commit": sha}), 200
+
 
 @app.get("/debug/whichdb")
 def debug_whichdb():
@@ -1561,12 +1998,16 @@ def debug_whichdb():
         return jsonify(info)
     else:
         db_file = DATABASE_URL.replace("sqlite:///", "")
-        return jsonify({"engine":"sqlite","db_file":db_file,"exists":os.path.exists(db_file)})
+        return jsonify({"engine": "sqlite", "db_file": db_file, "exists": os.path.exists(db_file)})
+
+
+
+
 
 
 
 # ----------------------
-# AI endpoints: ai/ask (simple), ai/humanhelper (routing with free-first + premium fallback)                                      
+# AI endpoints: ai/ask (simple), ai/humanhelper (routing with free-first + premium fallback)
 # ----------------------
 @app.route("/ai/ask", methods=["POST"])
 def ai_ask():
@@ -1587,11 +2028,13 @@ def ai_ask():
         # 1) OpenAI
         if OPENAI_API_KEY:
             ok1, res1 = ask_openai_rest(prompt, timeout=OPENAI_TIMEOUT)
-            if ok1: return jsonify({"ok": True, "provider": "openai", "answer": res1}), 200
+            if ok1:
+                return jsonify({"ok": True, "provider": "openai", "answer": res1}), 200
 
         # 2) Gemini
         ok2, res2 = gemini_free_chat(prompt, timeout=GEMINI_TIMEOUT)
-        if ok2: return jsonify({"ok": True, "provider": "gemini", "answer": res2}), 200
+        if ok2:
+            return jsonify({"ok": True, "provider": "gemini", "answer": res2}), 200
 
         # 3) OpenRouter
         if OPENROUTER_API_KEY:
@@ -1600,13 +2043,14 @@ def ai_ask():
                 if token.startswith("openrouter"):
                     model = token.split(":", 1)[1] if ":" in token else "gpt-oss-20b"
                     ok3, res3 = ask_openrouter(model, prompt, timeout=OPENROUTER_TIMEOUT)
-                    if ok3: 
+                    if ok3:
                         return jsonify({"ok": True, "provider": f"openrouter/{model}", "answer": res3}), 200
                     break
 
         # 4) LLaMA
         ok4, res4 = ask_llama(prompt, timeout=LLAMA_TIMEOUT)
-        if ok4: return jsonify({"ok": True, "provider": "llama", "answer": res4}), 200
+        if ok4:
+            return jsonify({"ok": True, "provider": "llama", "answer": res4}), 200
 
     return jsonify({"ok": False, "provider": "none", "error": ans_or_err}), 502
 
@@ -1646,7 +2090,7 @@ def ai_humanhelper():
     if OPENROUTER_API_KEY:
         for tok in FREE_MODELS_PRIORITY:
             if tok.startswith("openrouter"):
-                model = tok.split(":",1)[1] if ":" in tok else "gpt-oss-20b"
+                model = tok.split(":", 1)[1] if ":" in tok else "gpt-oss-20b"
                 ok_or, res_or = ask_openrouter(model, prompt, timeout=OPENROUTER_TIMEOUT)
                 if ok_or:
                     return jsonify({"ok": True, "provider": f"openrouter/{model}", "answer": res_or}), 200
@@ -1674,219 +2118,7 @@ def ai_status():
     })
 
 
-
-# =======================                                                                                                       
-# Auth blueprint + routes
-# =======================
-
-def _utcnow(): return datetime.now(timezone.utc)
-def _otp(): return f"{random.randint(100000,999999)}"
-
-MOBILE_IN_RE = re.compile(r'^[6-9]\d{9}$')          # India mobile
-EMAIL_RE = re.compile(r'^[^@\s]+@[^@\s]+\.[^@\s]+$')
-OTP_TTL_MIN = int(os.getenv("OTP_TTL_MIN","10"))
-SEND_VERIFICATION_MODE = os.getenv("SEND_VERIFICATION_MODE","console")
-
-def _send_code(dest: str, code: str):
-    if SEND_VERIFICATION_MODE == "console":
-        print(f"[VERIFY] send code {code} to {dest}")
-
-auth_bp = Blueprint("auth", __name__, url_prefix="/auth")
-
-def _clean(s): return (s or "").strip()
-
-@auth_bp.post("/register")
-@limiter.limit("10/hour")
-def register():
-    d = request.get_json(silent=True) or {}
-    name     = _clean(d.get("full_name"))
-    mobile   = _clean(d.get("mobile"))
-    password = d.get("password") or ""
-    email    = _clean(d.get("email"))
-    address  = _clean(d.get("address"))
-
-    if not name or len(name) < 2:              return jsonify({"error":"full_name required"}), 400
-    if not MOBILE_IN_RE.match(mobile):         return jsonify({"error":"invalid mobile (India 10-digit)"}), 400
-    if len(password) < 8:                      return jsonify({"error":"password must be at least 8 chars"}), 400
-    if email and not EMAIL_RE.match(email):    return jsonify({"error":"invalid email"}), 400
-    if len(address) < 4:                       return jsonify({"error":"address required"}), 400
-
-    code    = _otp()
-
-    expires = _now_ts() + OTP_TTL_MIN*60
-    pwd_hash = pbkdf2_sha256.hash(password)
-
-    db = get_db()
-    cur = db.cursor()
-    row = cur.execute("SELECT id,is_verified FROM users WHERE mobile=?", (mobile,)).fetchone()
-    if row and int(row["is_verified"]) == 1:
-        db.close()
-        return jsonify({"error":"mobile already registered"}), 409
-
-    # Upsert; keep user unverified until OTP verified
-    cur.execute("""
-        INSERT INTO users (name,mobile,email,address,password_hash,verification_code,verify_expires,is_verified)
-        VALUES (?,?,?,?,?,?,?,0)
-        ON CONFLICT(mobile) DO UPDATE SET
-            name=excluded.name,
-            email=excluded.email,
-            address=excluded.address,
-            password_hash=excluded.password_hash,
-            verification_code=excluded.verification_code,
-            verify_expires=excluded.verify_expires,
-            is_verified=0
-    """, (name, mobile, email, address, pwd_hash, code, expires))
-    db.commit(); db.close()
-
-    _send_code(mobile, code)
-    return jsonify({"message":"verification code sent","mobile":mobile,"expires_in_min":OTP_TTL_MIN}), 201
-
-@auth_bp.post("/verify")
-@limiter.limit("20/hour")
-def verify():
-    d = request.get_json(silent=True) or {}
-    mobile = _clean(d.get("mobile"))
-    code   = _clean(d.get("code"))
-
-    if not MOBILE_IN_RE.match(mobile):             return jsonify({"error":"invalid mobile"}), 400
-    if not code.isdigit() or len(code) != 6:       return jsonify({"error":"invalid code"}), 400
-
-    db = get_db()
-    row = db.execute(
-        "SELECT id,verification_code,verify_expires,is_verified FROM users WHERE mobile=?",
-        (mobile,)
-    ).fetchone()
-    if not row:                       db.close(); return jsonify({"error":"user not found"}), 404
-    if int(row["is_verified"]) == 1:  db.close(); return jsonify({"message":"already verified"}), 200
-    if (row["verification_code"] or "") != code:
-        db.close(); return jsonify({"error":"incorrect code"}), 400
-    if row["verify_expires"] and _now_ts() > int(row["verify_expires"]):
-        db.close(); return jsonify({"error":"code expired"}), 400
-
-    db.execute("UPDATE users SET is_verified=1, verification_code=NULL, verify_expires=NULL WHERE id=?", (row["id"],))
-    db.commit(); db.close()
-    return jsonify({"message":"verified"}), 200
-
-@auth_bp.post("/resend-code")
-@limiter.limit("5/hour")
-def resend_code():
-    d = request.get_json(silent=True) or {}
-    mobile = _clean(d.get("mobile"))
-    if not MOBILE_IN_RE.match(mobile): return jsonify({"error":"invalid mobile"}), 400
-
-    db = get_db()
-    row = db.execute("SELECT id,is_verified FROM users WHERE mobile=?", (mobile,)).fetchone()
-    if not row:                       db.close(); return jsonify({"error":"not registered"}), 404
-    if int(row["is_verified"]) == 1:  db.close(); return jsonify({"message":"already verified"}), 200
-
-    code = _otp()
-    expires = _now_ts() + OTP_TTL_MIN*60
-    db.execute("UPDATE users SET verification_code=?, verify_expires=? WHERE id=?", (code, expires, row["id"]))
-    db.commit(); db.close()
-    _send_code(mobile, code)
-    return jsonify({"message":"verification code re-sent","expires_in_min":OTP_TTL_MIN}), 200
-
-@auth_bp.post("/login")
-@limiter.limit("5/minute;50/hour")
-def login():
-    d = request.get_json(silent=True) or {}
-    mobile = _clean(d.get("mobile"))
-    password = d.get("password") or ""
-    if not MOBILE_IN_RE.match(mobile) or not password:
-        return jsonify({"error":"invalid credentials"}), 400
-
-    db = get_db()
-    row = db.execute(
-        "SELECT id,is_banned,is_verified,password_hash,name,email,address FROM users WHERE mobile=?",
-        (mobile,)
-    ).fetchone()
-    db.close()
-
-    if not row:                       return jsonify({"error":"user not found"}), 404
-    if row["is_banned"]:              return jsonify({"error":"account banned"}), 403
-    if not row["is_verified"]:        return jsonify({"error":"not verified"}), 403
-    if not pbkdf2_sha256.verify(password, row["password_hash"]):
-        return jsonify({"error":"invalid credentials"}), 401
-
-    # ✅ these MUST be inside the function and aligned here
-    access  = make_access_token(row["id"], mobile)
-    refresh = make_refresh_token(row["id"])
-
-    return jsonify({
-        "ok": True,
-        "user": {
-            "id": row["id"], "name": row["name"], "mobile": mobile,
-            "email": row["email"], "address": row["address"]
-        },
-        "access": access,
-        "refresh": refresh
-    }), 200
-
-@auth_bp.post("/refresh")
-def refresh():
-    """JSON: { refresh }  -> returns new access + rotated refresh"""
-    data = request.get_json(silent=True) or {}
-    token = (data.get("refresh") or "").strip()
-    payload = decode_token(token)
-    if not payload or payload.get("type") != "refresh":
-        return jsonify({"error": "invalid or expired refresh"}), 401
-
-    jti = payload.get("jti", "")
-    conn = get_db()
-    row = conn.execute(
-        "SELECT user_id, revoked, expires_at FROM refresh_tokens WHERE jti=?", (jti,)
-    ).fetchone()
-    if (not row) or row["revoked"] or row["expires_at"] < _now_ts():
-        conn.close()
-        return jsonify({"error": "refresh revoked/expired"}), 401
-
-    # rotate: revoke current, issue new
-    conn.execute("UPDATE refresh_tokens SET revoked=1 WHERE jti=?", (jti,))
-    conn.commit()   # ✅ must be indented to the same level as conn.execute
-
-    # fetch mobile for claim
-    mrow = conn.execute(
-        "SELECT mobile FROM users WHERE id=?", (row["user_id"],)
-    ).fetchone()
-    conn.close()
-
-    new_access = make_access_token(row["user_id"], mrow["mobile"])
-    new_refresh = make_refresh_token(row["user_id"])
-    return jsonify({"access": new_access, "refresh": new_refresh}), 200
-
-@auth_bp.post("/logout")
-def logout():
-    """JSON: { refresh }  -> revoke this refresh token"""
-    data = request.get_json(silent=True) or {}
-    token = (data.get("refresh") or "").strip()
-    payload = decode_token(token)
-    if not payload or payload.get("type") != "refresh":
-        return jsonify({"error":"invalid refresh"}), 400
-    jti = payload.get("jti","")
-    conn = get_db()
-    conn.execute("UPDATE refresh_tokens SET revoked=1 WHERE jti=?", (jti,))
-    conn.commit()
-    conn.close()
-    return jsonify({"message":"logged out"}), 200
-
-@app.before_request
-def _maybe_purge():
-    # ~1% of requests purge old refresh tokens
-    if random.randint(1,100) == 1:
-        try: clean_expired_refresh()
-        except Exception: pass
-
-@app.get("/whoami")
-@auth_required
-def whoami():
-    return jsonify({"user_id": g.user_id, "mobile": g.mobile})
-
-# register blueprint once
-app.register_blueprint(auth_bp)
-
-
-
-# =========================                                                                                                      
+# =========================
 # WALLET BLUEPRINT + ROUTES
 # =========================
 
@@ -1981,29 +2213,35 @@ def wallet_transfer():
     db = get_db(); cur = db.cursor()
     try:
         db.execute("BEGIN IMMEDIATE")
-        s = cur.execute("SELECT balance FROM users WHERE id=?", (g.user_id,)).fetchone()
-        if not s: raise ValueError("sender not found")
-        if float(s["balance"]) < amount: raise ValueError("insufficient balance")
-        if not cur.execute("SELECT 1 FROM users WHERE id=?", (receiver_id,)).fetchone():
+        s = db_exec(cur, "SELECT balance FROM users WHERE id=?", (g.user_id,)).fetchone()
+        if not s:
+            raise ValueError("sender not found")
+        if float(s["balance"]) < amount:
+            raise ValueError("insufficient balance")
+        if not db_exec(cur, "SELECT 1 FROM users WHERE id=?", (receiver_id,)).fetchone():
             raise ValueError("receiver not found")
 
-        cur.execute("UPDATE users SET balance = balance - ? WHERE id=?", (amount, g.user_id))
-        r1 = cur.execute("SELECT balance, locked_balance FROM users WHERE id=?", (g.user_id,)).fetchone()
-        cur.execute("""INSERT INTO wallet_txns
+        db_exec(cur, "UPDATE users SET balance = balance - ? WHERE id=?", (amount, g.user_id))
+        r1 = db_exec(cur, "SELECT balance, locked_balance FROM users WHERE id=?", (g.user_id,)).fetchone()
+        db_exec(cur, """INSERT INTO wallet_txns
             (user_id,kind,amount,balance_after,locked_after,status,ref,note,meta)
             VALUES (?,?,?,?,?,'success',NULL,?,NULL)
         """, (g.user_id, "p2p_out", -amount, r1["balance"], r1["locked_balance"], f"to user:{receiver_id}"))
 
-        cur.execute("UPDATE users SET balance = balance + ? WHERE id=?", (amount, receiver_id))
-        r2 = cur.execute("SELECT balance, locked_balance FROM users WHERE id=?", (receiver_id,)).fetchone()
-        cur.execute("""INSERT INTO wallet_txns
+        db_exec(cur, "UPDATE users SET balance = balance + ? WHERE id=?", (amount, receiver_id))
+        r2 = db_exec(cur, "SELECT balance, locked_balance FROM users WHERE id=?", (receiver_id,)).fetchone()
+        db_exec(cur, """INSERT INTO wallet_txns
             (user_id,kind,amount,balance_after,locked_after,status,ref,note,meta)
             VALUES (?,?,?,?,?,'success',NULL,?,NULL)
         """, (receiver_id, "p2p_in", amount, r2["balance"], r2["locked_balance"], f"from user:{g.user_id}"))
 
         db.commit()
     except Exception as e:
-        db.rollback(); db.close()
+        try:
+            db.rollback()
+        except Exception:
+            pass
+        db.close()
         return err(str(e), 400)
     db.close()
     return ok({"message":"transfer complete"})
@@ -2030,17 +2268,18 @@ def wallet_withdraw():
     wreq_id = None; payout_id = None
     try:
         db.execute("BEGIN IMMEDIATE")
-        r = cur.execute("SELECT balance FROM users WHERE id=?", (g.user_id,)).fetchone()
+        r = db_exec(cur, "SELECT balance FROM users WHERE id=?", (g.user_id,)).fetchone()
         if not r or float(r["balance"]) < amount:
             raise ValueError("insufficient balance")
 
         # move to locked
-        cur.execute("""
+        db_exec(cur, """
             UPDATE users
             SET balance = balance - ?, locked_balance = locked_balance + ?
-            WHERE id=?""", (amount, amount, g.user_id))
-        rlock = cur.execute("SELECT balance, locked_balance FROM users WHERE id=?", (g.user_id,)).fetchone()
-        cur.execute("""INSERT INTO wallet_txns
+            WHERE id=?
+        """, (amount, amount, g.user_id))
+        rlock = db_exec(cur, "SELECT balance, locked_balance FROM users WHERE id=?", (g.user_id,)).fetchone()
+        db_exec(cur, """INSERT INTO wallet_txns
             (user_id,kind,amount,balance_after,locked_after,status,ref,note,meta)
             VALUES (?,?,?,?,?,'requested',?, ?, ?)
         """, (g.user_id, "withdraw_lock", -amount, rlock["balance"], rlock["locked_balance"],
@@ -2048,13 +2287,17 @@ def wallet_withdraw():
               json.dumps({"upi": upi_id, "net": net, "fee": fee_total})))
 
         # record withdrawal request as processing
-        cur.execute("""INSERT INTO withdrawal_requests
+        db_exec(cur, """INSERT INTO withdrawal_requests
             (user_id, amount, net_amount, fee_amount, upi, status)
             VALUES (?,?,?,?,?,'processing')""", (g.user_id, amount, net, fee_total, upi_id))
         wreq_id = cur.lastrowid
         db.commit()
     except Exception as e:
-        db.rollback(); db.close()
+        try:
+            db.rollback()
+        except Exception:
+            pass
+        db.close()
         return err(str(e), 400)
 
     # call Razorpay outside transaction
@@ -2065,43 +2308,46 @@ def wallet_withdraw():
         db.execute("BEGIN IMMEDIATE")
         if not ok_pay:
             # release lock
-            cur.execute("""
+            db_exec(cur, """
                 UPDATE users
                 SET balance = balance + ?, locked_balance = locked_balance - ?
-                WHERE id=?""", (amount, amount, g.user_id))
-            rrel = cur.execute("SELECT balance, locked_balance FROM users WHERE id=?", (g.user_id,)).fetchone()
-            cur.execute("""INSERT INTO wallet_txns
+                WHERE id=?
+            """, (amount, amount, g.user_id))
+            rrel = db_exec(cur, "SELECT balance, locked_balance FROM users WHERE id=?", (g.user_id,)).fetchone()
+            db_exec(cur, """INSERT INTO wallet_txns
                 (user_id,kind,amount,balance_after,locked_after,status,ref,note,meta)
                 VALUES (?,?,?,?,?,'failed',?, ?, ?)""",
                 (g.user_id, "withdraw_release", amount, rrel["balance"], rrel["locked_balance"],
                  f"WREQ:{wreq_id}", "payout failed", json.dumps({"err": str(res)[:240]})))
-            cur.execute("UPDATE withdrawal_requests SET status='failed', reason=?, updated_at=CURRENT_TIMESTAMP WHERE id=?",
-                        (str(res)[:240], wreq_id))
+            db_exec(cur, "UPDATE withdrawal_requests SET status='failed', reason=?, updated_at=CURRENT_TIMESTAMP WHERE id=?", (str(res)[:240], wreq_id))
             db.commit(); db.close()
             return err("payout failed", 502, extra={"details": str(res)})
 
         # success: clear lock, credit pooled fee, mark paid
         payout_id = res.get("id") if isinstance(res, dict) else None
-        cur.execute("UPDATE users SET locked_balance = locked_balance - ? WHERE id=?", (amount, g.user_id))
-        rset = cur.execute("SELECT balance, locked_balance FROM users WHERE id=?", (g.user_id,)).fetchone()
-        cur.execute("""INSERT INTO wallet_txns
+        db_exec(cur, "UPDATE users SET locked_balance = locked_balance - ? WHERE id=?", (amount, g.user_id))
+        rset = db_exec(cur, "SELECT balance, locked_balance FROM users WHERE id=?", (g.user_id,)).fetchone()
+        db_exec(cur, """INSERT INTO wallet_txns
             (user_id,kind,amount,balance_after,locked_after,status,ref,note,meta)
             VALUES (?,?,?,?,?,'success',?, ?, NULL)""",
             (g.user_id, "withdraw_settle", 0.0, rset["balance"], rset["locked_balance"],
              f"WREQ:{wreq_id}", f"payout success: {payout_id}"))
 
         # add the ENTIRE fee to the single pool
-        cur.execute("""
+        db_exec(cur, """
             UPDATE fee_pool
             SET pool_balance = pool_balance + ?, updated_at = CURRENT_TIMESTAMP
             WHERE id=1
         """, (fee_total,))
 
-        cur.execute("UPDATE withdrawal_requests SET status='paid', payout_id=?, updated_at=CURRENT_TIMESTAMP WHERE id=?",
-                    (payout_id, wreq_id))
+        db_exec(cur, "UPDATE withdrawal_requests SET status='paid', payout_id=?, updated_at=CURRENT_TIMESTAMP WHERE id=?", (payout_id, wreq_id))
         db.commit()
     except Exception as e:
-        db.rollback(); db.close()
+        try:
+            db.rollback()
+        except Exception:
+            pass
+        db.close()
         return err("post-payout update failed", 500, extra={"details": str(e)})
     db.close()
 
@@ -2117,8 +2363,7 @@ def wallet_withdraw():
 app.register_blueprint(wallet_bp)
 
 
-
-# ----------------------                                                                                                          
+# ----------------------
 # GitHub helpers
 # ----------------------
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN", "")
@@ -2190,12 +2435,12 @@ def github_gist():
     return jsonify({"ok": True, "url": res})
 
 
-
 # ----------------------
-# Start-up: init DB and writer non-fatally                                                                                       
+# Start-up: init DB and writer non-fatally
 # ----------------------
 try:
-    init_db()
+    if not IS_PG:
+        init_db()
 except Exception as e:
     print("[hh] init_db failed (nonfatal):", e)
 
@@ -2205,13 +2450,9 @@ except Exception as e:
     print("[hh] start_writer failed (nonfatal):", e)
 
 
-
 # ----------------------
 # Run app
 # ----------------------
-# Start background cleanup thread (runs every 6h)
-threading.Thread(target=_cleanup_loop, daemon=True).start()
-
 if __name__ == "__main__":
     port = int(os.getenv("PORT", 5000))
     print("[hh] Starting HumanHelper backend on port", port)
@@ -2220,3 +2461,6 @@ if __name__ == "__main__":
     print("[hh] DEEPSEEK configured:", bool(DEEPSEEK_API_KEY))
     print("[hh] FREE_MODELS_PRIORITY:", FREE_MODELS_PRIORITY)
     app.run(host="0.0.0.0", port=port, debug=True)
+
+
+

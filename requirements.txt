@@ -11,6 +11,7 @@ gunicorn==21.2.0
 SQLAlchemy==2.0.43
 greenlet==3.2.4
 psycopg2-binary==2.9.9
+psycopg[binary]>=3.1
 
 # --- Auth, Security & Password Hashing ---
 passlib==1.7.4
