@@ -1,91 +1,95 @@
 #!/usr/bin/env bash
 set -euo pipefail
-BASE="http://127.0.0.1:5000"
-LLAMA="http://127.0.0.1:5001/completion"
+BASE="${BASE:-https://api.humanhelperai.in}"   # change if needed
 ADMIN_TOKEN="${ADMIN_TOKEN:-Muralidhar}"
+PASS="Passw0rd!"
+A_MOBILE="9876509001"
+B_MOBILE="9876509002"
 
-echo "=== HumanHelper smoke tests ==="
-echo
+echo "BASE=$BASE"
+echo "Check version"
+curl -s "$BASE/version" | jq .
 
-# Helper
-call() {
-  local method="$1"; shift
-  curl -s -X "$method" "$@" || echo "curl failed"
-}
+echo; echo "Check health + DB engine"
+curl -s "$BASE/health" | jq . || true
+curl -s "$BASE/debug/whichdb" | jq . || true
 
-# 0) service health
-echo -n "Health: "
-health=$(call GET "$BASE/health")
-if echo "$health" | grep -q '"status": "ok"'; then echo "PASS"; else echo "FAIL: $health"; fi
+echo; echo "Register A ($A_MOBILE)"
+curl -s -X POST "$BASE/auth/register" -H 'Content-Type: application/json' \
+  -d "{\"full_name\":\"Smoke A\",\"mobile\":\"$A_MOBILE\",\"password\":\"$PASS\",\"address\":\"addr\"}" | jq .
 
-# 1) signup (random mobile to avoid conflict)
-MOBILE="999${RANDOM:0:4}"
-echo "Testing signup with mobile: $MOBILE"
-signup=$(curl -s -X POST "$BASE/signup" -H "Content-Type: application/json" -d "{\"name\":\"TT\",\"mobile\":\"$MOBILE\",\"aadhar\":\"1111\",\"password\":\"pass123\"}")
-echo " signup -> $signup"
-if echo "$signup" | grep -q "User registered"; then echo "SIGNUP PASS"; else echo "SIGNUP FAIL"; fi
-echo
+echo; echo "Register B ($B_MOBILE)"
+curl -s -X POST "$BASE/auth/register" -H 'Content-Type: application/json' \
+  -d "{\"full_name\":\"Smoke B\",\"mobile\":\"$B_MOBILE\",\"password\":\"$PASS\",\"address\":\"addr\"}" | jq .
 
-# 2) login
-echo "Testing login"
-login=$(curl -s -X POST "$BASE/login" -H "Content-Type: application/json" -d "{\"mobile\":\"$MOBILE\",\"password\":\"pass123\"}")
-echo " login -> $login"
-if echo "$login" | grep -q "Login successful"; then echo "LOGIN PASS"; else echo "LOGIN FAIL"; fi
-echo
+echo; echo "Simulate verify for A/B — if OTP flow used, paste OTP here"
+# If your app prints OTP to logs (SEND_VERIFICATION_MODE=console), read from logs and set these:
+OTP_A="${OTP_A:-123456}"
+OTP_B="${OTP_B:-123456}"
 
-# 3) deposit (simulate)
-echo "Testing deposit (adds 10)"
-dep=$(curl -s -X POST "$BASE/deposit" -H "Content-Type: application/json" -d "{\"mobile\":\"$MOBILE\",\"amount\":10}")
-echo " deposit -> $dep"
-if echo "$dep" | grep -q "message"; then echo "DEPOSIT CALL OK"; else echo "DEPOSIT FAIL"; fi
-echo
+curl -s -X POST "$BASE/auth/verify" -H 'Content-Type: application/json' \
+  -d "{\"mobile\":\"$A_MOBILE\",\"code\":\"$OTP_A\"}" | jq .
+curl -s -X POST "$BASE/auth/verify" -H 'Content-Type: application/json' \
+  -d "{\"mobile\":\"$B_MOBILE\",\"code\":\"$OTP_B\"}" | jq .
 
-# 4) check balance
-bal=$(curl -s "$BASE/balance/$MOBILE")
-echo " balance -> $bal"
-echo
+echo; echo "Login A and B"
+LOGIN_A=$(curl -s -X POST "$BASE/auth/login" -H 'Content-Type: application/json' \
+  -d "{\"mobile\":\"$A_MOBILE\",\"password\":\"$PASS\"}")
+echo "$LOGIN_A" | jq .
+ACCESS_A=$(echo "$LOGIN_A" | jq -r .access // empty)
+REFRESH_A=$(echo "$LOGIN_A" | jq -r .refresh // empty)
 
-# 5) earn endpoint (call reward_user)
-echo "Testing earn endpoint (duration 10)"
-earn=$(curl -s -X POST "$BASE/earn" -H "Content-Type: application/json" -d "{\"mobile\":\"$MOBILE\",\"video_id\":\"v1\",\"content_type\":\"video\",\"duration\":10}")
-echo " earn -> $earn"
-echo
+LOGIN_B=$(curl -s -X POST "$BASE/auth/login" -H 'Content-Type: application/json' \
+  -d "{\"mobile\":\"$B_MOBILE\",\"password\":\"$PASS\"}")
+echo "$LOGIN_B" | jq .
+ACCESS_B=$(echo "$LOGIN_B" | jq -r .access // empty)
+REFRESH_B=$(echo "$LOGIN_B" | jq -r .refresh // empty)
 
-# 6) charity balance
-char=$(curl -s "$BASE/charity/balance")
-echo " charity balance -> $char"
-echo
+echo; echo "Whoami A"
+curl -s "$BASE/whoami" -H "Authorization: Bearer $ACCESS_A" | jq . || true
 
-# 7) Admin list users (requires admin header)
-echo "Admin list users (should require ADMIN_TOKEN)"
-adm=$(curl -s -X GET "$BASE/admin/users" -H "X-Admin-Token: $ADMIN_TOKEN")
-echo " admin/users -> $adm"
-echo
+echo; echo "Admin: seed A with 500 (uses ADMIN_TOKEN)"
+# Need UID_A — fetch via whoami or admin users
+WHO_A=$(curl -s "$BASE/whoami" -H "Authorization: Bearer $ACCESS_A" || echo "{}")
+UID_A=$(echo "$WHO_A" | jq -r .user_id // empty)
+if [ -z "$UID_A" ] || [ "$UID_A" = "null" ]; then
+  echo "Cannot get UID_A from whoami; falling back to admin /users list"
+  curl -s -H "X-Admin-Token: $ADMIN_TOKEN" "$BASE/admin/users?limit=5" | jq .
+  # If you find the id manually, set UID_A accordingly
+fi
 
-# 8) Test AI LLaMA availability direct
-echo -n "LLAMA direct call: "
-ll=$(curl -s -X POST "$LLAMA" -H "Content-Type: application/json" -d '{"prompt":"Hello from smoke test","n_predict":32}')
-if echo "$ll" | grep -q '"content"'; then echo "PASS"; else echo "FAIL: $ll"; fi
-echo
+if [ -n "$UID_A" ] && [ "$UID_A" != "null" ]; then
+  curl -s -X POST "$BASE/admin/user/adjust" \
+    -H "X-Admin-Token: $ADMIN_TOKEN" -H 'Content-Type: application/json' \
+    -d "{\"user_id\": $UID_A, \"delta\": 500, \"note\": \"seed\"}" | jq .
+fi
 
-# 9) Test /ai/humanhelper endpoint (non-premium)
-echo -n "AI humanhelper (no premium): "
-ai=$(curl -s -X POST "$BASE/ai/humanhelper" -H "Content-Type: application/json" -d '{"prompt":"Explain how to boil an egg"}')
-echo "$ai" | sed -n '1,6p'
-if echo "$ai" | grep -q '"provider"'; then echo "AI ENDPOINT OK"; else echo "AI ENDPOINT FAIL"; fi
-echo
+echo; echo "Transfer A -> B: 25"
+# Get UID_B
+WHO_B=$(curl -s "$BASE/whoami" -H "Authorization: Bearer $ACCESS_B" || echo "{}")
+UID_B=$(echo "$WHO_B" | jq -r .user_id // empty)
+if [ -z "$UID_B" ] || [ "$UID_B" = "null" ]; then
+  echo "Cannot get UID_B from whoami; use admin/users to find id"
+fi
+curl -s -X POST "$BASE/wallet/transfer" \
+  -H "Authorization: Bearer $ACCESS_A" -H 'Content-Type: application/json' \
+  -d "{\"receiver_id\": $UID_B, \"amount\": 25}" | jq .
 
-# 10) Test premium flow (admin token = premium)
-echo -n "AI humanhelper (premium via X-Admin-Token): "
-ai2=$(curl -s -X POST "$BASE/ai/humanhelper" -H "Content-Type: application/json" -H "X-Admin-Token: $ADMIN_TOKEN" -d '{"prompt":"Write a professional email asking for a quote"}')
-echo "$ai2" | sed -n '1,6p'
-if echo "$ai2" | grep -q '"provider"'; then echo "AI PREMIUM PATH OK"; else echo "AI PREMIUM PATH FAIL"; fi
-echo
+echo; echo "Balances A and B"
+curl -s "$BASE/wallet/balance" -H "Authorization: Bearer $ACCESS_A" | jq .
+curl -s "$BASE/wallet/balance" -H "Authorization: Bearer $ACCESS_B" | jq .
 
-# 11) Test ai/ask simpler endpoint
-echo -n "AI /ai/ask: "
-a3=$(curl -s -X POST "$BASE/ai/ask" -H "Content-Type: application/json" -d '{"prompt":"Say hi"}')
-echo "$a3" | sed -n '1,6p'
-echo
+echo; echo "Create withdraw from A (small amount) — requires Razorpay config to succeed"
+curl -s -X POST "$BASE/wallet/withdraw" -H "Authorization: Bearer $ACCESS_A" -H 'Content-Type: application/json' \
+  -d '{"amount": 100, "upi_id":"test@upi"}' | jq .
 
-echo "=== smoke tests finished ==="
+echo; echo "Admin: fee pool"
+curl -s "$BASE/admin/wallet/fees" -H "X-Admin-Token: $ADMIN_TOKEN" | jq .
+
+echo; echo "Admin: repair-withdrawals (manual)"
+curl -s -X POST "$BASE/admin/tools/repair-withdrawals" -H "X-Admin-Token: $ADMIN_TOKEN" | jq .
+
+echo; echo "Transactions A"
+curl -s "$BASE/wallet/transactions?limit=20" -H "Authorization: Bearer $ACCESS_A" | jq .
+
+echo; echo "Done smoke tests"
