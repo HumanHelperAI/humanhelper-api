@@ -1,24 +1,35 @@
-<<<<<<< HEAD
+# Python / virtualenv
 .venv/
+env/
+venv/
 __pycache__/
 *.pyc
-*.bak
-*.log
-db.sqlite3
+*.pyo
+*.pyd
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
+*.swp
+
+# Local db / env / secrets
 .env
-.venv/
-__pycache__/
-*.pyc
-*.bak
-*.log
+.env.local
+secrets/
 db.sqlite3
-.env
-llama.cpp/
+db.test.sqlite3
+migrations/
+*.log
+
+# Node / frontend
 node_modules/
-testfile
-=======
-my key
-my key.pub
+build/
+dist/
+out/
+
+# keys (do NOT commit private keys)
 id_ed25519
 id_ed25519.pub
->>>>>>> origin/main
+my_key
+my_key.pub
