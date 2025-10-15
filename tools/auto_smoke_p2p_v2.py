@@ -1,0 +1,205 @@
+#!/usr/bin/env python3
+"""
+Auto smoke test v2: register two users, auto-read OTPs, verify, login, fund A, transfer A->B.
+
+Usage examples:
+  BASE="http://127.0.0.1:5000" ADMIN_TOKEN="Muralidhar" PASS="Passw0rd!" python3 tools/auto_smoke_p2p_v2.py
+  # skip admin funding & skip admin debug:
+  python3 tools/auto_smoke_p2p_v2.py --no-admin --fund-amount 0 --save-otps
+"""
+
+from __future__ import annotations
+import os
+import sys
+import time
+import json
+import random
+import sqlite3
+import argparse
+import requests
+from typing import Optional, Tuple, Dict, Any
+
+BASE = os.environ.get("BASE", "http://127.0.0.1:5000").rstrip("/")
+ADMIN_TOKEN = os.environ.get("ADMIN_TOKEN", "")
+PASS = os.environ.get("PASS", "Passw0rd!")
+
+DEFAULT_HEADERS = {"Content-Type": "application/json"}
+
+def log(s: str, *a):
+    print(s.format(*a), file=sys.stdout)
+
+def call_json(method: str, path: str, json_payload: dict | None = None, headers: dict | None = None, timeout: int = 10) -> Tuple[Optional[int], dict]:
+    url = BASE + path
+    headers = {**(headers or {}), **DEFAULT_HEADERS}
+    try:
+        r = requests.request(method, url, json=json_payload, headers=headers, timeout=timeout)
+    except Exception as e:
+        return None, {"error": str(e)}
+    try:
+        return r.status_code, r.json()
+    except Exception:
+        return r.status_code, {"text": r.text}
+
+def whichdb() -> dict:
+    s, j = call_json("GET", "/debug/whichdb")
+    return j or {}
+
+def register(full_name: str, mobile: str, password: str, address: str = "addr") -> Tuple[Optional[int], dict]:
+    payload = {"full_name": full_name, "mobile": mobile, "password": password, "address": address}
+    return call_json("POST", "/auth/register", json_payload=payload)
+
+def verify(mobile: str, code: str) -> Tuple[Optional[int], dict]:
+    return call_json("POST", "/auth/verify", json_payload={"mobile": mobile, "code": code})
+
+def login(mobile: str, password: str) -> Tuple[Optional[int], dict]:
+    return call_json("POST", "/auth/login", json_payload={"mobile": mobile, "password": password})
+
+def admin_debug_otp(mobile: str) -> Tuple[Optional[dict], Optional[str]]:
+    if not ADMIN_TOKEN:
+        return None, "no admin token"
+    headers = {"X-Admin-Token": ADMIN_TOKEN}
+    s, j = call_json("GET", f"/admin/debug/otp?mobile={mobile}", headers=headers)
+    if s is None:
+        return None, "network"
+    return j, None
+
+def read_otp_from_sqlite(db_file: str, mobile: str) -> Optional[str]:
+    try:
+        conn = sqlite3.connect(db_file)
+        conn.row_factory = sqlite3.Row
+        cur = conn.cursor()
+        cur.execute("SELECT verification_code, verify_expires FROM users WHERE mobile = ? ORDER BY id DESC LIMIT 1", (mobile,))
+        r = cur.fetchone()
+        conn.close()
+        if not r:
+            return None
+        code = r["verification_code"]
+        if code is None:
+            return None
+        return str(code)
+    except Exception:
+        return None
+
+def admin_adjust(user_id: int, delta: float, note: str = "smoke test seed") -> Tuple[Optional[int], dict]:
+    headers = {"X-Admin-Token": ADMIN_TOKEN}
+    payload = {"user_id": int(user_id), "delta": float(delta), "note": note}
+    return call_json("POST", "/admin/user/adjust", json_payload=payload, headers=headers)
+
+def transfer(access_token: str, receiver_id: int, amount: float) -> Tuple[Optional[int], dict]:
+    headers = {"Authorization": f"Bearer {access_token}"}
+    payload = {"receiver_id": int(receiver_id), "amount": float(amount)}
+    return call_json("POST", "/wallet/transfer", json_payload=payload, headers=headers)
+
+def get_otp_for_mobile(mobile: str, db_info: dict) -> Tuple[Optional[str], Optional[str]]:
+    # 1) Try admin debug endpoint
+    if ADMIN_TOKEN:
+        j, err = admin_debug_otp(mobile)
+        if j and isinstance(j, dict) and j.get("ok"):
+            code = j.get("verification_code")
+            if code:
+                return str(code), "admin-debug"
+    # 2) If sqlite, attempt to read local sqlite file
+    if db_info.get("engine") == "sqlite":
+        db_file = db_info.get("db_file") or db_info.get("path") or "db.sqlite3"
+        # try local path
+        if not os.path.exists(db_file):
+            db_file = os.path.join(os.getcwd(), db_file)
+        if os.path.exists(db_file):
+            c = read_otp_from_sqlite(db_file, mobile)
+            if c:
+                return c, f"sqlite:{db_file}"
+    return None, None
+
+def main(argv):
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--no-admin", action="store_true", help="Skip admin funding / admin debug OTP attempt")
+    parser.add_argument("--fund-amount", type=float, default=20.0, help="Amount to credit to user A via admin (0 to skip)")
+    parser.add_argument("--save-otps", action="store_true", help="Save retrieved OTPs to last_otps.json")
+    args = parser.parse_args(argv)
+
+    log("Base: {}", BASE)
+    log("Detecting DB engine via /debug/whichdb ...")
+    db_info = whichdb()
+    log("DB info: {}", db_info)
+
+    sfx_a = "".join(random.choices("abcdefghijklmnopqrstuvwxyz0123456789", k=4))
+    sfx_b = "".join(random.choices("abcdefghijklmnopqrstuvwxyz0123456789", k=4))
+    user_a = {"name": f"SmokeA-{sfx_a}", "mobile": "9876509001", "password": PASS, "address": "addrA"}
+    user_b = {"name": f"SmokeB-{sfx_b}", "mobile": "9876509002", "password": PASS, "address": "addrB"}
+
+    log("\nRegistering A: {} / {}", user_a["name"], user_a["mobile"])
+    s, j = register(user_a["name"], user_a["mobile"], user_a["password"], user_a["address"])
+    log("register A -> {} {}", s, j)
+
+    log("\nRegistering B: {} / {}", user_b["name"], user_b["mobile"])
+    s, j = register(user_b["name"], user_b["mobile"], user_b["password"], user_b["address"])
+    log("register B -> {} {}", s, j)
+
+    time.sleep(0.2)
+
+    log("\nAttempting to retrieve OTPs...")
+    otp_a, src_a = get_otp_for_mobile(user_a["mobile"], db_info) if not args.no_admin else (None, None)
+    otp_b, src_b = get_otp_for_mobile(user_b["mobile"], db_info) if not args.no_admin else (None, None)
+    log("otp A: {} (src={})", otp_a, src_a)
+    log("otp B: {} (src={})", otp_b, src_b)
+
+    if args.save_otps:
+        path = os.path.join(os.getcwd(), "last_otps.json")
+        data = {"a": {"mobile": user_a["mobile"], "otp": otp_a, "src": src_a}, "b": {"mobile": user_b["mobile"], "otp": otp_b, "src": src_b}}
+        with open(path, "w") as f:
+            json.dump(data, f, indent=2)
+        log("Saved OTPs to {}", path)
+
+    # If OTPs not found, inform user and try to continue (maybe manual)
+    if not otp_a or not otp_b:
+        log("Warning: Could not auto-retrieve both OTPs. Check server console (/verify prints) or admin endpoint.")
+        # continue: we'll still try to verify if we have one or both
+    else:
+        log("\nVerifying A with {}", otp_a)
+        s, j = verify(user_a["mobile"], otp_a)
+        log("verify A -> {} {}", s, j)
+
+        log("\nVerifying B with {}", otp_b)
+        s, j = verify(user_b["mobile"], otp_b)
+        log("verify B -> {} {}", s, j)
+
+    log("\nLogging in user A ...")
+    s_a, j_a = login(user_a["mobile"], user_a["password"])
+    log("login A -> {} {}", s_a, j_a)
+    if s_a != 200 or not j_a.get("access"):
+        log("ERROR: login A failed; exiting with code 2")
+        return 2
+
+    log("\nLogging in user B ...")
+    s_b, j_b = login(user_b["mobile"], user_b["password"])
+    log("login B -> {} {}", s_b, j_b)
+    if s_b != 200 or not j_b.get("access"):
+        log("ERROR: login B failed; exiting with code 3")
+        return 3
+
+    access_a = j_a["access"]
+    uid_a = j_a["user"]["id"]
+    uid_b = j_b["user"]["id"]
+
+    log("\nUser A id={} User B id={}", uid_a, uid_b)
+
+    if not args.no_admin and ADMIN_TOKEN and args.fund_amount and args.fund_amount > 0:
+        log("\nAttempting admin adjust to credit A id={} amount {}", uid_a, args.fund_amount)
+        s, j = admin_adjust(uid_a, args.fund_amount, note="smoke test seed")
+        log("admin adjust -> {} {}", s, j)
+        if s != 200:
+            log("Warning: admin adjust failed (status {}). Continuing anyway.", s)
+
+    log("\nPerforming P2P transfer A -> B amount 10.0 ...")
+    s, j = transfer(access_a, uid_b, 10.0)
+    log("transfer -> {} {}", s, j)
+    if s != 200:
+        log("ERROR: transfer failed; exiting with code 4")
+        return 4
+
+    log("\nSmoke finished successfully.")
+    return 0
+
+if __name__ == "__main__":
+    code = main(sys.argv[1:])
+    sys.exit(code)

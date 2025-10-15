@@ -1,0 +1,197 @@
+#!/usr/bin/env python3
+"""
+Auto smoke test: register two users, auto-read OTPs, verify, login, fund A, transfer A->B.
+
+Usage:
+  BASE="http://127.0.0.1:5000" ADMIN_TOKEN="Muralidhar" PASS="Passw0rd!" python3 tools/auto_smoke_p2p.py
+"""
+
+import os
+import time
+import random
+import sqlite3
+import requests
+import sys
+
+BASE = os.environ.get("BASE", "http://127.0.0.1:5000").rstrip("/")
+ADMIN_TOKEN = os.environ.get("ADMIN_TOKEN", "")
+PASS = os.environ.get("PASS", "Passw0rd!")
+
+HEADERS = {"Content-Type": "application/json"}
+
+def dbg(msg, *a):
+    print(msg.format(*a))
+
+def call_json(method, path, json=None, headers=None, auth=None, timeout=10):
+    url = BASE + path
+    headers = headers or {}
+    try:
+        r = requests.request(method, url, json=json, headers=headers, timeout=timeout)
+    except Exception as e:
+        return None, {"status": None, "error": str(e)}
+    try:
+        return r.status_code, r.json()
+    except Exception:
+        return r.status_code, {"text": r.text}
+
+def whichdb():
+    s, j = call_json("GET", "/debug/whichdb")
+    return j if j else {}
+
+def register(full_name, mobile, password, address="addr"):
+    payload = {
+        "full_name": full_name,
+        "mobile": mobile,
+        "password": password,
+        "address": address
+    }
+    return call_json("POST", "/auth/register", json=payload, headers=HEADERS)
+
+def verify(mobile, code):
+    payload = {"mobile": mobile, "code": code}
+    return call_json("POST", "/auth/verify", json=payload, headers=HEADERS)
+
+def login(mobile, password):
+    payload = {"mobile": mobile, "password": password}
+    return call_json("POST", "/auth/login", json=payload, headers=HEADERS)
+
+def admin_debug_otp(mobile):
+    if not ADMIN_TOKEN:
+        return None, "no admin token"
+    headers = {"X-Admin-Token": ADMIN_TOKEN}
+    s, j = call_json("GET", f"/admin/debug/otp?mobile={mobile}", headers=headers)
+    return j if j else None, None
+
+def read_otp_from_sqlite(db_file, mobile):
+    # Attempts to read verification_code from local sqlite DB
+    try:
+        conn = sqlite3.connect(db_file)
+        conn.row_factory = sqlite3.Row
+        cur = conn.cursor()
+        cur.execute("SELECT verification_code, verify_expires FROM users WHERE mobile = ? ORDER BY id DESC LIMIT 1", (mobile,))
+        r = cur.fetchone()
+        conn.close()
+        if not r:
+            return None
+        return r["verification_code"]
+    except Exception as e:
+        return None
+
+def make_admin_adjust(user_id, delta, note="smoke test seed"):
+    headers = {"X-Admin-Token": ADMIN_TOKEN, "Content-Type": "application/json"}
+    payload = {"user_id": user_id, "delta": float(delta), "note": note}
+    return call_json("POST", "/admin/user/adjust", json=payload, headers=headers)
+
+def transfer(access_token, receiver_id, amount):
+    headers = {"Authorization": f"Bearer {access_token}", "Content-Type": "application/json"}
+    payload = {"receiver_id": int(receiver_id), "amount": float(amount)}
+    return call_json("POST", "/wallet/transfer", json=payload, headers=headers)
+
+def get_otp_for_mobile(mobile, db_info):
+    # Try admin debug endpoint (preferred for Postgres)
+    otp = None
+    otp_source = None
+
+    try:
+        j, err = admin_debug_otp(mobile)
+        if j and isinstance(j, dict) and j.get("ok"):
+            # admin debug returns verification_code maybe, or "verification_code": null if already verified
+            code = j.get("verification_code")
+            if code:
+                return str(code), "admin-debug"
+    except Exception:
+        pass
+
+    # If debug/whichdb indicates sqlite and gives db_file — attempt direct read
+    if db_info.get("engine") == "sqlite":
+        db_file = db_info.get("db_file") or db_info.get("path") or "db.sqlite3"
+        # If path is relative, try to resolve in current working dir
+        if not os.path.exists(db_file):
+            # try same dir as BASE server working dir? we assume local test so check cwd
+            db_file = os.path.join(os.getcwd(), db_file)
+        if os.path.exists(db_file):
+            otp = read_otp_from_sqlite(db_file, mobile)
+            if otp:
+                return str(otp), f"sqlite:{db_file}"
+    return None, None
+
+def main():
+    dbg("Base URL: {}", BASE)
+    dbg("Detecting DB engine via /debug/whichdb ...")
+    db_info = whichdb()
+    dbg("DB info: {}", db_info)
+
+    # create two test users with random suffix so they don't collide
+    sfx_a = "".join(random.choices("abcdefghijklmnopqrstuvwxyz0123456789", k=4))
+    sfx_b = "".join(random.choices("abcdefghijklmnopqrstuvwxyz0123456789", k=4))
+    A = {"name": f"SmokeA-{sfx_a}", "mobile": "9876509001", "password": PASS, "address": "addrA"}
+    B = {"name": f"SmokeB-{sfx_b}", "mobile": "9876509002", "password": PASS, "address": "addrB"}
+
+    dbg("\nRegistering user A: {} / {}", A["name"], A["mobile"])
+    s, j = register(A["name"], A["mobile"], A["password"], A["address"])
+    dbg("register A -> {} {}", s, j)
+
+    dbg("\nRegistering user B: {} / {}", B["name"], B["mobile"])
+    s, j = register(B["name"], B["mobile"], B["password"], B["address"])
+    dbg("register B -> {} {}", s, j)
+
+    # small sleep to ensure server persisted OTP
+    time.sleep(0.5)
+
+    dbg("\nAttempting to retrieve OTPs automatically...")
+    otp_a, src_a = get_otp_for_mobile(A["mobile"], db_info)
+    otp_b, src_b = get_otp_for_mobile(B["mobile"], db_info)
+    dbg("otp A: {} (src={})", otp_a, src_a)
+    dbg("otp B: {} (src={})", otp_b, src_b)
+
+    if not otp_a or not otp_b:
+        dbg("Failed to auto-read both OTPs. You can read via server logs (console) or admin debug endpoint.")
+        # continue only if at least both found
+    else:
+        dbg("\nVerifying A with OTP {} ...", otp_a)
+        s, j = verify(A["mobile"], otp_a)
+        dbg("verify A -> {} {}", s, j)
+
+        dbg("\nVerifying B with OTP {} ...", otp_b)
+        s, j = verify(B["mobile"], otp_b)
+        dbg("verify B -> {} {}", s, j)
+
+    dbg("\nLogging in user A ...")
+    s, j = login(A["mobile"], A["password"])
+    dbg("login A -> {} {}", s, j)
+    if s != 200 or not j.get("access"):
+        dbg("Login A failed; aborting.")
+        return
+
+    dbg("\nLogging in user B ...")
+    s2, j2 = login(B["mobile"], B["password"])
+    dbg("login B -> {} {}", s2, j2)
+    if s2 != 200 or not j2.get("access"):
+        dbg("Login B failed; aborting.")
+        return
+
+    access_a = j["access"]
+    access_b = j2["access"]
+    uid_a = j["user"]["id"]
+    uid_b = j2["user"]["id"]
+
+    dbg("\nUser A id={} access present: {}", uid_a, bool(access_a))
+    dbg("User B id={} access present: {}", uid_b, bool(access_b))
+
+    # fund user A via admin adjust
+    if not ADMIN_TOKEN:
+        dbg("ADMIN_TOKEN not provided; skipping admin fund.")
+    else:
+        dbg("\nTrying admin HTTP adjust to credit user A (id={}) with ₹20.0 ...", uid_a)
+        s, j = make_admin_adjust(uid_a, 20.0, note="smoke test seed")
+        dbg("admin adjust result: {} {}", s, j)
+
+    # do P2P transfer
+    dbg("\nDoing P2P transfer from A (id={}) -> B (id={}) amount ₹10.0 ...", uid_a, uid_b)
+    s, j = transfer(access_a, uid_b, 10.0)
+    dbg("transfer -> {} {}", s, j)
+
+    dbg("\nSmoke test finished.")
+
+if __name__ == "__main__":
+    main()

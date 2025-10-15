@@ -30,6 +30,8 @@ from urllib.parse import urlparse
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
 logger = logging.getLogger("humanhelper")
 
+
+
 # -----------------------
 # DATABASE_URL handling
 # -----------------------
@@ -351,10 +353,6 @@ def _fix_placeholders(sql: str) -> str:
     return "".join(out)
 
 
-def execq(db, sql: str, params: tuple = ()):
-    """Execute a query on the given db connection with placeholder fixing."""
-    return db.execute(_fix_placeholders(sql), params)
-
 
 def insert_ret_id(db, sql: str, params: tuple = ()) -> int:
     """
@@ -377,6 +375,13 @@ def insert_ret_id(db, sql: str, params: tuple = ()) -> int:
             return int(getattr(cur, "lastrowid", 0) or 0)
         except Exception:
             return 0
+
+
+
+
+
+
+
 
 
 
@@ -421,6 +426,13 @@ def ratelimit_handler(e):
     }), 429
 
 
+
+
+
+
+
+
+
 # ----------------------
 # Fallback DB helpers (if `database` module not present)
 # ----------------------
@@ -456,6 +468,13 @@ except Exception:
         db.commit()
         db.close()
         return rows
+
+
+
+
+
+
+
 
 
 
@@ -667,18 +686,86 @@ def _bg_schema_tick():
 
 
 
+
+
+
+
+
+
+
 # ------------------------
 # Small helper: unify param style between sqlite and psycopg2
 # ------------------------
-def db_exec(cur, sql: str, params: tuple = ()):
-    """Execute SQL using the correct placeholder style for the active DB.
-    Use '?' in the SQL here (sqlite style) and this helper will convert to '%s'
-    for psycopg2 when IS_PG is True.
+# ---------- DB exec helper (works for both sqlite & psycopg2) ----------
+def db_exec(db_conn, sql: str, params: tuple | list = ()):
     """
-    if IS_PG:
-        # convert sqlite-style placeholders (?) to psycopg2 (%s)
-        sql = sql.replace("?", "%s")
-    return cur.execute(sql, params)
+    Engine-agnostic SQL executor.
+    - Use %s placeholders in SQL. When running on SQLite this function will
+      translate %s -> ? automatically. On Postgres it leaves %s as-is.
+    - db_conn may be:
+        * sqlite3.Connection
+        * sqlite3.Cursor
+        * our _PgConn wrapper (connection-like with .cursor())
+        * psycopg2 cursor
+    Returns a cursor-like object (so caller can .fetchone()/.fetchall()).
+    """
+    if params is None:
+        params = ()
+
+    # If db_conn exposes .cursor(), assume it's a connection-like object.
+    # Otherwise assume it's already a cursor and use it directly.
+    cur = None
+    conn_object = None
+    try:
+        # prefer to detect connection-like objects that provide cursor()
+        if hasattr(db_conn, "cursor"):
+            conn_object = db_conn
+            cur = db_conn.cursor()
+        else:
+            # caller passed a cursor already
+            cur = db_conn
+    except Exception:
+        # fallback: treat db_conn as cursor
+        cur = db_conn
+
+    # Normalize SQL placeholder style for SQLite vs Postgres
+    sql_to_run = sql if IS_PG else sql.replace("%s", "?")
+
+    # Execute. Note: sqlite3.Cursor.execute accepts params as sequence/tuple.
+    # psycopg2 cursor.execute accepts tuple as well.
+    try:
+        cur.execute(sql_to_run, tuple(params))
+    except Exception:
+        # If the connection object supports .execute directly (some wrappers),
+        # try that as a fallback.
+        if conn_object is not None and hasattr(conn_object, "execute"):
+            try:
+                conn_object.execute(sql_to_run, tuple(params))
+                # Return a cursor if possible
+                try:
+                    return conn_object.cursor()
+                except Exception:
+                    return conn_object
+            except Exception:
+                pass
+        # re-raise original error for logging upstream
+        raise
+
+    return cur
+
+
+def execq(db, sql: str, params: tuple = ()):
+    """Execute a query on the given db connection with placeholder fixing."""
+    return db.execute(_fix_placeholders(sql), params)
+
+
+
+
+
+
+
+
+
 
 # =========================
 # ADMIN BLUEPRINT + ROUTES
@@ -983,12 +1070,70 @@ def admin_fix_fee_pool():
         db.close()
         return jsonify({"ok": False, "error": {"code":"internal_error","message": str(e)}}), 500
 
-
 @admin_bp.post("/tools/repair-withdrawals")
 @admin_required
 def admin_repair_withdrawals():
     n = _repair_stuck_withdrawals(max_age_min=0)  # repair immediately
     return jsonify({"ok": True, "released": n})
+
+
+# --- Admin debug OTP endpoint (GET) ---
+# Place this inside the admin blueprint area (near other admin_bp.route handlers)
+@admin_bp.route("/debug/otp", methods=["GET"])
+@admin_required
+def admin_debug_otp():
+    """
+    Debug-only: return the verification_code and expiry for a mobile.
+    Example: GET /admin/debug/otp?mobile=9876509001  (requires X-Admin-Token header)
+    """
+    mobile = (request.args.get("mobile") or "").strip()
+    if not mobile:
+        return jsonify({"ok": False, "error": {"code": "bad_request", "message": "mobile query param required"}}), 400
+
+    conn = get_db()
+    try:
+        # Select correct placeholder for current DB engine
+        placeholder = "%s" if IS_PG else "?"
+        sql = f"SELECT id, verification_code, verify_expires, is_verified FROM users WHERE mobile = {placeholder}"
+
+        # execq expects the proper placeholder style in SQL
+        cur = execq(conn, sql, (mobile,))
+        row = cur.fetchone()
+        if not row:
+            return jsonify({"ok": False, "error": {"code": "not_found", "message": "user not found"}}), 404
+
+        # Row may be dict-like (psycopg2 RealDictCursor) or sqlite3.Row or tuple/list.
+        try:
+            # Preferred access for dict-like / mapping
+            uid = row["id"]
+            code = row["verification_code"]
+            expires = row["verify_expires"]
+            is_verified = bool(row["is_verified"])
+        except Exception:
+            # Fallback for sequence/tuple-like rows: (id, verification_code, verify_expires, is_verified)
+            uid = row[0] if len(row) > 0 else None
+            code = row[1] if len(row) > 1 else None
+            expires = row[2] if len(row) > 2 else None
+            is_verified = bool(row[3]) if len(row) > 3 else False
+
+        return jsonify({
+            "ok": True,
+            "mobile": mobile,
+            "user_id": uid,
+            "verification_code": code,
+            "expires": expires,
+            "is_verified": is_verified
+        }), 200
+
+    except Exception as e:
+        app.logger.exception("admin_debug_otp: db error")
+        return jsonify({"ok": False, "error": {"code": "internal_error", "message": str(e)}}), 500
+
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
 
 
 # ✅ Register admin blueprint once (AFTER all routes above are defined)
@@ -997,85 +1142,12 @@ app.register_blueprint(admin_bp)
 
 
 
-# ----------------------
-# Wallet helpers (module-level)
-# ----------------------
-def _user_by_id(uid: int):
-    db = get_db()
-    cur = db.cursor()
-    row = db_exec(cur, "SELECT id, balance, locked_balance, is_verified, is_banned FROM users WHERE id=?", (uid,)).fetchone()
-    db.close()
-    return row
 
 
-try:
-    from writer import start_writer, enqueue_write
-except Exception:
-    def start_writer():
-        print("[hh] writer.start_writer stub")
-
-    def enqueue_write(sql, params=(), timeout=1.0):
-        # emulate synchronous success
-        return True, None, ["immediate"], 0, None
-
-    print("[hh] Warning: writer module not found — using stub enqueue_write")
 
 
-try:
-    from wallet import deposit, withdraw
-except Exception:
-    def deposit(mobile, amount):
-        return False, "wallet not configured"
-    def withdraw(mobile, amount):
-        return False, "wallet not configured"
-    print("[hh] Warning: wallet module not found — using stubs")
 
 
-try:
-    from earnings import reward_user
-except Exception:
-    def reward_user(mobile, video_id, content_type, duration):
-        return False, "earnings not configured"
-    print("[hh] Warning: earnings module not found — using stubs")
-
-
-# -------- Razorpay Payout (UPI only) --------
-RAZORPAY_KEY_ID = os.getenv("RAZORPAY_KEY_ID", "")
-RAZORPAY_KEY_SECRET = os.getenv("RAZORPAY_KEY_SECRET", "")
-RAZORPAY_PAYOUT_URL = "https://api.razorpay.com/v1/payouts"
-
-def _razorpay_payout_upi(upi_id: str, amount_inr: float, ref: str, timeout: int = 12) -> tuple[bool, dict | str]:
-    if not (RAZORPAY_KEY_ID and RAZORPAY_KEY_SECRET):
-        return False, "razorpay not configured"
-
-    # amount in paise
-    amt = int(round(amount_inr * 100))
-    payload = {
-        "account_number": os.getenv("RAZORPAY_VPA_SOURCE_ACC", ""),  # Your virtual account/RAZORPAY account no
-        "fund_account": {
-            "account_type": "vpa",
-            "vpa": {"address": upi_id},
-            "contact": {"name": "HH User", "type": "employee"}  # Razorpay requires a contact; VPA payouts allow inline
-        },
-        "amount": amt,
-        "currency": "INR",
-        "mode": "UPI",
-        "purpose": "payout",
-        "queue_if_low_balance": True,
-        "reference_id": ref,
-        "narration": "HumanHelper Withdrawal"
-    }
-    try:
-        r = requests.post(
-            RAZORPAY_PAYOUT_URL,
-            auth=(RAZORPAY_KEY_ID, RAZORPAY_KEY_SECRET),
-            json=payload, timeout=timeout
-        )
-        if r.status_code >= 400:
-            return False, f"razorpay {r.status_code}: {(r.text or '')[:500]}"
-        return True, r.json()
-    except Exception as e:
-        return False, str(e)
 
 
 # ----------------------
@@ -1753,15 +1825,32 @@ def _send_code(dest: str, code: str):
 def _clean(s): return (s or "").strip()
 
 
+
+
+
+
+
+
+
+
+
+
+
+
+
+# ----------------------
+# Auth: register + verify
+# ----------------------
+
 @auth_bp.post("/register")
 @limiter.limit("10/hour")
 def register():
     d = request.get_json(silent=True) or {}
-    name = _clean(d.get("full_name"))
-    mobile = _clean(d.get("mobile"))
+    name     = _clean(d.get("full_name"))
+    mobile   = _clean(d.get("mobile"))
     password = d.get("password") or ""
-    email = _clean(d.get("email"))
-    address = _clean(d.get("address"))
+    email    = _clean(d.get("email"))
+    address  = _clean(d.get("address"))
 
     if not name or len(name) < 2:
         return jsonify({"error": "full_name required"}), 400
@@ -1778,31 +1867,62 @@ def register():
     expires = _now_ts() + OTP_TTL_MIN * 60
     pwd_hash = pbkdf2_sha256.hash(password)
 
-    db = get_db()
-    cur = db.cursor()
-    row = cur.execute("SELECT id, is_verified FROM users WHERE mobile=?", (mobile,)).fetchone()
-    if row and int(row["is_verified"]) == 1:
-        db.close()
-        return jsonify({"error": "mobile already registered"}), 409
+    conn = None
+    try:
+        conn = get_db()
+        # Use db_exec which will normalize %s -> ? for sqlite and keep %s for PG
+        sql = """
+            INSERT INTO users
+               (name,mobile,email,address,password_hash,verification_code,verify_expires,is_verified)
+               VALUES (%s,%s,%s,%s,%s,%s,%s,0)
+            ON CONFLICT(mobile) DO UPDATE SET
+               name = excluded.name,
+               email = excluded.email,
+               address = excluded.address,
+               password_hash = excluded.password_hash,
+               verification_code = excluded.verification_code,
+               verify_expires = excluded.verify_expires,
+               is_verified = 0
+        """
+        db_exec(conn, sql, (name, mobile, email, address, pwd_hash, code, expires))
 
-    # Upsert; keep user unverified until OTP verified
-    cur.execute("""
-        INSERT INTO users (name,mobile,email,address,password_hash,verification_code,verify_expires,is_verified)
-        VALUES (?,?,?,?,?,?,?,0)
-        ON CONFLICT(mobile) DO UPDATE SET
-            name=excluded.name,
-            email=excluded.email,
-            address=excluded.address,
-            password_hash=excluded.password_hash,
-            verification_code=excluded.verification_code,
-            verify_expires=excluded.verify_expires,
-            is_verified=0
-    """, (name, mobile, email, address, pwd_hash, code, expires))
-    db.commit()
-    db.close()
+        # commit (best-effort; rollback on failure)
+        try:
+            conn.commit()
+        except Exception:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
 
-    _send_code(mobile, code)
-    return jsonify({"message": "verification code sent", "mobile": mobile, "expires_in_min": OTP_TTL_MIN}), 201
+        # developer-friendly output + configured sender
+        print(f"[VERIFY] send code {code} to {mobile}")
+        try:
+            _send_code(mobile, code)
+        except Exception:
+            app.logger.exception("register: _send_code failed")
+
+        return jsonify({
+            "message": "verification code sent",
+            "mobile": mobile,
+            "expires_in_min": OTP_TTL_MIN
+        }), 201
+
+    except Exception as e:
+        app.logger.exception("register: db error")
+        try:
+            if conn:
+                conn.rollback()
+        except Exception:
+            pass
+        return jsonify({"ok": False, "error": {"code": "internal_error", "message": str(e)}}), 500
+
+    finally:
+        try:
+            if conn:
+                conn.close()
+        except Exception:
+            pass
 
 
 @auth_bp.post("/verify")
@@ -1817,21 +1937,52 @@ def verify():
     if not code.isdigit() or len(code) != 6:
         return jsonify({"error": "invalid code"}), 400
 
-    db = get_db()
-    row = db.execute("SELECT id,verification_code,verify_expires,is_verified FROM users WHERE mobile=?", (mobile,)).fetchone()
-    if not row:
-        db.close(); return jsonify({"error": "user not found"}), 404
-    if int(row["is_verified"]) == 1:
-        db.close(); return jsonify({"message": "already verified"}), 200
-    if (row["verification_code"] or "") != code:
-        db.close(); return jsonify({"error": "incorrect code"}), 400
-    if row["verify_expires"] and _now_ts() > int(row["verify_expires"]):
-        db.close(); return jsonify({"error": "code expired"}), 400
+    conn = None
+    try:
+        conn = get_db()
+        # SELECT using engine-agnostic db_exec
+        cur = db_exec(conn, "SELECT id, verification_code, verify_expires, is_verified FROM users WHERE mobile=%s", (mobile,))
+        row = cur.fetchone()
+        if not row:
+            return jsonify({"error": "user not found"}), 404
 
-    db.execute("UPDATE users SET is_verified=1, verification_code=NULL, verify_expires=NULL WHERE id=?", (row["id"],))
-    db.commit(); db.close()
-    return jsonify({"message": "verified"}), 200
+        # row supports both sqlite3.Row and psycopg2 RealDictRow via mapping access
+        is_verified = int(row["is_verified"]) if row["is_verified"] is not None else 0
+        if is_verified == 1:
+            return jsonify({"message": "already verified"}), 200
 
+        stored_code = (row["verification_code"] or "")
+        if stored_code != code:
+            return jsonify({"error": "incorrect code"}), 400
+
+        if row["verify_expires"] and _now_ts() > int(row["verify_expires"]):
+            return jsonify({"error": "code expired"}), 400
+
+        db_exec(conn, "UPDATE users SET is_verified=1, verification_code=NULL, verify_expires=NULL WHERE id=%s", (row["id"],))
+        try:
+            conn.commit()
+        except Exception:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+
+        return jsonify({"message": "verified"}), 200
+
+    except Exception as e:
+        app.logger.exception("verify: db error")
+        try:
+            if conn:
+                conn.rollback()
+        except Exception:
+            pass
+        return jsonify({"ok": False, "error": {"code": "internal_error", "message": str(e)}}), 500
+    finally:
+        try:
+            if conn:
+                conn.close()
+        except Exception:
+            pass
 
 @auth_bp.post("/resend-code")
 @limiter.limit("5/hour")
@@ -1957,6 +2108,13 @@ def whoami():
 app.register_blueprint(auth_bp)
 
 
+
+
+
+
+
+
+
 # ----------------------
 # Simple utility endpoints
 # ----------------------
@@ -1999,6 +2157,9 @@ def debug_whichdb():
     else:
         db_file = DATABASE_URL.replace("sqlite:///", "")
         return jsonify({"engine": "sqlite", "db_file": db_file, "exists": os.path.exists(db_file)})
+
+
+
 
 
 
@@ -2116,6 +2277,13 @@ def ai_status():
             "premium_flow": "OpenAI -> Gemini -> OpenRouter -> LLaMA."
         }
     })
+
+
+
+
+
+
+
 
 
 # =========================
@@ -2359,8 +2527,96 @@ def wallet_withdraw():
         "payout_id": payout_id
     })
 
+
+# ----------------------
+# Wallet helpers (module-level)
+# ----------------------
+def _user_by_id(uid: int):
+    db = get_db()
+    cur = db.cursor()
+    row = db_exec(cur, "SELECT id, balance, locked_balance, is_verified, is_banned FROM users WHERE id=?", (uid,)).fetchone()
+    db.close()
+    return row
+
+
+try:
+    from writer import start_writer, enqueue_write
+except Exception:
+    def start_writer():
+        print("[hh] writer.start_writer stub")
+
+    def enqueue_write(sql, params=(), timeout=1.0):
+        # emulate synchronous success
+        return True, None, ["immediate"], 0, None
+
+    print("[hh] Warning: writer module not found — using stub enqueue_write")
+
+
+try:
+    from wallet import deposit, withdraw
+except Exception:
+    def deposit(mobile, amount):
+        return False, "wallet not configured"
+    def withdraw(mobile, amount):
+        return False, "wallet not configured"
+    print("[hh] Warning: wallet module not found — using stubs")
+
+
+try:
+    from earnings import reward_user
+except Exception:
+    def reward_user(mobile, video_id, content_type, duration):
+        return False, "earnings not configured"
+    print("[hh] Warning: earnings module not found — using stubs")
+
+
+# -------- Razorpay Payout (UPI only) --------
+RAZORPAY_KEY_ID = os.getenv("RAZORPAY_KEY_ID", "")
+RAZORPAY_KEY_SECRET = os.getenv("RAZORPAY_KEY_SECRET", "")
+RAZORPAY_PAYOUT_URL = "https://api.razorpay.com/v1/payouts"
+
+def _razorpay_payout_upi(upi_id: str, amount_inr: float, ref: str, timeout: int = 12) -> tuple[bool, dict | str]:
+    if not (RAZORPAY_KEY_ID and RAZORPAY_KEY_SECRET):
+        return False, "razorpay not configured"
+
+    # amount in paise
+    amt = int(round(amount_inr * 100))
+    payload = {
+        "account_number": os.getenv("RAZORPAY_VPA_SOURCE_ACC", ""),  # Your virtual account/RAZORPAY account no
+        "fund_account": {
+            "account_type": "vpa",
+            "vpa": {"address": upi_id},
+            "contact": {"name": "HH User", "type": "employee"}  # Razorpay requires a contact; VPA payouts allow inline
+        },
+        "amount": amt,
+        "currency": "INR",
+        "mode": "UPI",
+        "purpose": "payout",
+        "queue_if_low_balance": True,
+        "reference_id": ref,
+        "narration": "HumanHelper Withdrawal"
+    }
+    try:
+        r = requests.post(
+            RAZORPAY_PAYOUT_URL,
+            auth=(RAZORPAY_KEY_ID, RAZORPAY_KEY_SECRET),
+            json=payload, timeout=timeout
+        )
+        if r.status_code >= 400:
+            return False, f"razorpay {r.status_code}: {(r.text or '')[:500]}"
+        return True, r.json()
+    except Exception as e:
+        return False, str(e)
+
+
 # register wallet blueprint once
 app.register_blueprint(wallet_bp)
+
+
+
+
+
+
 
 
 # ----------------------
@@ -2435,6 +2691,13 @@ def github_gist():
     return jsonify({"ok": True, "url": res})
 
 
+
+
+
+
+
+
+
 # ----------------------
 # Start-up: init DB and writer non-fatally
 # ----------------------
@@ -2448,6 +2711,12 @@ try:
     start_writer()
 except Exception as e:
     print("[hh] start_writer failed (nonfatal):", e)
+
+
+
+
+
+
 
 
 # ----------------------

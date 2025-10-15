@@ -1,0 +1,12 @@
+{
+  "a": {
+    "mobile": "9876509001",
+    "otp": "634594",
+    "src": "sqlite:db.sqlite3"
+  },
+  "b": {
+    "mobile": "9876509002",
+    "otp": "242136",
+    "src": "sqlite:db.sqlite3"
+  }
+}
