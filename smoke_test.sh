@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 BASE="${BASE:-https://api.humanhelperai.in}"   # change if needed
-ADMIN_TOKEN="${ADMIN_TOKEN:-Muralidhar}"
-PASS="Passw0rd!"
+ADMIN_TOKEN="${ADMIN_TOKEN:-}"
+PASS="REQUIRE_ENV_PASS"
 A_MOBILE="9876509001"
 B_MOBILE="9876509002"
 

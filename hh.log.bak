@@ -1,0 +1,15 @@
+/data/data/com.termux/files/home/humanhelper/backend/.venv/lib/python3.12/site-packages/flask_limiter/extension.py:333: UserWarning: Using the in-memory storage for tracking rate limits as no storage was explicitly specified. This is not recommended for production use. See: https://flask-limiter.readthedocs.io#configuring-a-storage-backend for documentation about configuring the storage backend.
+  warnings.warn(
+[migrate:sqlite] ✅ schema ensured
+[db] engine=sqlite url=sqlite:///db.test.sqlite3…
+[hh] Database initialized ✅ (sqlite)
+🧹 Old logs cleanup done
+[hh] Starting HumanHelper backend on port 5000
+[hh] OPENROUTER configured: False
+[hh] OpenAI configured: True
+[hh] DEEPSEEK configured: True
+[hh] FREE_MODELS_PRIORITY: ['openai:gpt-4o-mini', 'gemini:gemini-2.0-flash', 'openrouter:gpt-oss-20b']
+ * Serving Flask app 'app'
+ * Debug mode: on
+Address already in use
+Port 5000 is in use by another program. Either identify and stop that program, or start the server with a different port.

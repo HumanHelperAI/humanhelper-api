@@ -1,0 +1,5 @@
+nohup: ignoring input
+Searching for files >200M in: /data/data/com.termux/files/home/models
+
+📂 Copying: /data/data/com.termux/files/home/models/tinyllama-q4.gguf (637 MB) -> /data/data/com.termux/files/home/storage/external-1/BigFiles/tinyllama-q4.gguf
+/data/data/com.termux/files/home/humanhelper/backend/copy_bigfiles.sh: line 30: bc: command not found

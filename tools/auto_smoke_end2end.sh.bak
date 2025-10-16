@@ -1,0 +1,151 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Usage:
+# BASE="http://127.0.0.1:5000" ADMIN_TOKEN="<REDACTED_ADMIN_TOKEN>" PASS="REQUIRE_ENV_PASS" ./tools/auto_smoke_end2end.sh
+
+BASE="${BASE:-http://127.0.0.1:5000}"
+ADMIN_TOKEN="${ADMIN_TOKEN:-}"
+PASS="${PASS:-REQUIRE_ENV_PASS}"
+
+# helper: http
+http() {
+  curl -sS "$@"
+}
+
+jqf() { jq -r "$@"; }
+
+rand_name() { echo "Smoke$(head /dev/urandom | tr -dc a-z0-9 | head -c4)"; }
+
+echo "Base URL: $BASE"
+echo "Admin token: ${ADMIN_TOKEN:0:6}..."
+
+# Create two test users
+A_NAME="$(rand_name)-A"
+B_NAME="$(rand_name)-B"
+A_MOBILE="9876509001"
+B_MOBILE="9876509002"
+
+echo "Registering A: $A_NAME / $A_MOBILE"
+regA=$(http -X POST "$BASE/auth/register" -H 'Content-Type: application/json' \
+  -d "{\"full_name\":\"$A_NAME\",\"mobile\":\"$A_MOBILE\",\"password\":\"$PASS\",\"address\":\"addrA\"}")
+echo "register A -> $regA"
+
+echo "Registering B: $B_NAME / $B_MOBILE"
+regB=$(http -X POST "$BASE/auth/register" -H 'Content-Type: application/json' \
+  -d "{\"full_name\":\"$B_NAME\",\"mobile\":\"$B_MOBILE\",\"password\":\"$PASS\",\"address\":\"addrB\"}")
+echo "register B -> $regB"
+
+# function to fetch OTP via admin debug endpoint
+get_otp_admin() {
+  local mobile="$1"
+  local attempts=0
+  local max_attempts=12   # ~60s (12 * 5s)
+  while [ $attempts -lt $max_attempts ]; do
+    attempts=$((attempts+1))
+    resp=$(http -H "X-Admin-Token: $ADMIN_TOKEN" "$BASE/admin/debug/otp?mobile=$mobile" || true)
+    code=$(echo "$resp" | jq -r '.verification_code // empty' 2>/dev/null || true)
+    is_verified=$(echo "$resp" | jq -r '.is_verified // false' 2>/dev/null || true)
+    if [ -n "$code" ] && [ "$code" != "null" ]; then
+      echo "$code"
+      return 0
+    fi
+    # If the user is already verified, nothing to do.
+    if [ "$is_verified" = "true" ]; then
+      echo "__ALREADY_VERIFIED__"
+      return 0
+    fi
+    # try resend-code endpoint once every few attempts (to ensure a fresh code is stored)
+    if [ $((attempts % 4)) -eq 0 ]; then
+      echo "Requesting resend-code for $mobile (attempt $attempts)..."
+      http -X POST "$BASE/auth/resend-code" -H 'Content-Type: application/json' \
+        -d "{\"mobile\":\"$mobile\"}" >/dev/null || true
+    fi
+    sleep 5
+  done
+  echo ""
+  return 1
+}
+
+# get OTPs for both users
+echo "Attempting to read OTPs via admin debug..."
+otpA=$(get_otp_admin "$A_MOBILE")
+otpB=$(get_otp_admin "$B_MOBILE")
+
+echo "OTP A: $otpA"
+echo "OTP B: $otpB"
+
+# If either is empty, try reading via /debug/whichdb -> sqlite path (local-only)
+if { [ -z "$otpA" ] || [ -z "$otpB" ]; } && command -v sqlite3 >/dev/null 2>&1; then
+  echo "Fallback: trying to read OTPs directly from sqlite DB (local-only)..."
+  dbinfo=$(http "$BASE/debug/whichdb")
+  dbfile=$(echo "$dbinfo" | jq -r '.db_file // empty' 2>/dev/null || true)
+  if [ -n "$dbfile" ] && [ -f "$dbfile" ]; then
+    otpA_local=$(sqlite3 "$dbfile" "SELECT verification_code FROM users WHERE mobile='$A_MOBILE' ORDER BY id DESC LIMIT 1;" 2>/dev/null || true)
+    otpB_local=$(sqlite3 "$dbfile" "SELECT verification_code FROM users WHERE mobile='$B_MOBILE' ORDER BY id DESC LIMIT 1;" 2>/dev/null || true)
+    otpA="${otpA:-$otpA_local}"
+    otpB="${otpB:-$otpB_local}"
+    echo "otpA_local: $otpA_local otpB_local: $otpB_local"
+  fi
+fi
+
+# If either indicates already verified, set to blank for skip
+if [ "$otpA" = "__ALREADY_VERIFIED__" ]; then otpA=""; fi
+if [ "$otpB" = "__ALREADY_VERIFIED__" ]; then otpB=""; fi
+
+# Verify endpoints
+if [ -n "$otpA" ]; then
+  echo "Verifying A with OTP $otpA"
+  vresA=$(http -X POST "$BASE/auth/verify" -H 'Content-Type: application/json' \
+    -d "{\"mobile\":\"$A_MOBILE\",\"code\":\"$otpA\"}" || true)
+  echo "verify A -> $vresA"
+else
+  echo "Skipping verify A (already verified or OTP not found)."
+fi
+
+if [ -n "$otpB" ]; then
+  echo "Verifying B with OTP $otpB"
+  vresB=$(http -X POST "$BASE/auth/verify" -H 'Content-Type: application/json' \
+    -d "{\"mobile\":\"$B_MOBILE\",\"code\":\"$otpB\"}" || true)
+  echo "verify B -> $vresB"
+else
+  echo "Skipping verify B (already verified or OTP not found)."
+fi
+
+# Login both users
+echo "Logging in user A..."
+loginA=$(http -X POST "$BASE/auth/login" -H 'Content-Type: application/json' \
+  -d "{\"mobile\":\"$A_MOBILE\",\"password\":\"$PASS\"}")
+echo "login A -> $loginA"
+A_ACCESS=$(echo "$loginA" | jq -r '.access // empty')
+A_ID=$(echo "$loginA" | jq -r '.user.id // empty')
+
+echo "Logging in user B..."
+loginB=$(http -X POST "$BASE/auth/login" -H 'Content-Type: application/json' \
+  -d "{\"mobile\":\"$B_MOBILE\",\"password\":\"$PASS\"}")
+echo "login B -> $loginB"
+B_ACCESS=$(echo "$loginB" | jq -r '.access // empty')
+B_ID=$(echo "$loginB" | jq -r '.user.id // empty')
+
+if [ -z "$A_ACCESS" ] || [ -z "$B_ACCESS" ]; then
+  echo "ERROR: login tokens not present. Aborting."
+  exit 1
+fi
+
+echo "A_ID=$A_ID B_ID=$B_ID"
+
+# Admin credit A so we can transfer
+echo "Admin: crediting A (id=$A_ID) with 20.0 ..."
+admin_resp=$(http -X POST "$BASE/admin/user/adjust" -H "X-Admin-Token: $ADMIN_TOKEN" \
+  -H 'Content-Type: application/json' \
+  -d "{\"user_id\":$A_ID,\"delta\":20.0,\"note\":\"smoke test seed\"}")
+echo "admin adjust -> $admin_resp"
+
+# Perform transfer (A -> B)
+echo "Performing P2P transfer from A(id=$A_ID) -> B(id=$B_ID) amount 10.0 ..."
+transfer_resp=$(http -X POST "$BASE/wallet/transfer" -H "Authorization: Bearer $A_ACCESS" \
+  -H 'Content-Type: application/json' \
+  -d "{\"amount\":10.0,\"receiver_id\":$B_ID}")
+echo "transfer -> $transfer_resp"
+
+echo "SMOKE TEST COMPLETE."

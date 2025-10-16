@@ -7,7 +7,7 @@ set -euo pipefail
 #   ./e2e_ai_check.sh
 
 BASE_URL="${BASE_URL:-http://127.0.0.1:5000}"
-ADMIN_TOKEN="${ADMIN_TOKEN:-Muralidhar}"
+ADMIN_TOKEN="${ADMIN_TOKEN:-}"
 # helper: pretty json if jq available
 pretty() {
   if command -v jq >/dev/null 2>&1; then

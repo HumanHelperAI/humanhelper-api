@@ -26,6 +26,8 @@ from werkzeug.exceptions import HTTPException
 import sqlite3
 from urllib.parse import urlparse
 
+
+
 # Basic logger so import-time messages are visible
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
 logger = logging.getLogger("humanhelper")
@@ -394,6 +396,43 @@ from flask_limiter.errors import RateLimitExceeded
 
 app = Flask(__name__)
 app.url_map.strict_slashes = False
+
+# --- Production-safe defaults (paste near app init) ---
+import os, secrets
+app.config.setdefault("ENV", os.getenv("FLASK_ENV", "production"))
+app.config.setdefault("DEBUG", False)
+app.config.setdefault("TESTING", False)
+app.config.setdefault("SECRET_KEY", os.getenv("SECRET_KEY", os.getenv("JWT_SECRET", secrets.token_urlsafe(64))))
+app.config.setdefault("SESSION_COOKIE_SECURE", True)
+app.config.setdefault("SESSION_COOKIE_HTTPONLY", True)
+app.config.setdefault("SESSION_COOKIE_SAMESITE", "Lax")
+
+
+from flask_talisman import Talisman
+
+TALISMAN_CONFIG = {
+    "force_https": True,
+    "strict_transport_security": True,
+    "strict_transport_security_max_age": 31536000,  # 1 year
+    # minimal CSP; tighten as needed for your static assets
+    "content_security_policy": {
+        "default-src": ["'self'"],
+        "script-src": ["'self'"],
+        "style-src": ["'self'"],
+        "img-src": ["'self' data:"],
+    },
+    "frame_options": "DENY"
+}
+Talisman(app, **TALISMAN_CONFIG)
+
+from flask_limiter import Limiter
+from flask_limiter.util import get_remote_address
+import os
+
+redis_url = os.getenv("RATE_LIMIT_REDIS", "redis://127.0.0.1:6379/0")
+limiter = Limiter(key_func=get_remote_address, storage_uri=redis_url, default_limits=["200 per day", "50 per hour"])
+limiter.init_app(app)
+
 
 # Use REDIS_URL if present, else fallback to in-memory (dev)
 RATE_LIMIT_STORAGE_URI = os.getenv("REDIS_URL") or os.getenv("RATE_LIMIT_REDIS_URI")
@@ -773,15 +812,55 @@ def execq(db, sql: str, params: tuple = ()):
 
 admin_bp = Blueprint("admin", __name__, url_prefix="/admin")
 
+# ---------- Admin auth decorator (use ADMIN_TOKEN from env only) ----------
+from functools import wraps
+from flask import request, jsonify
 
-def admin_required(fn):
-    @wraps(fn)
-    def _wrap(*a, **k):
-        token = (request.headers.get("X-Admin-Token") or "").strip()
-        if token != os.getenv("ADMIN_TOKEN", "changeme"):
-            return jsonify({"ok": False, "error": {"code": "forbidden", "message": "admin auth failed"}}), 403
-        return fn(*a, **k)
+# Read admin token from env at import time; helper to reload if you update .env
+def _get_admin_token():
+    # Prefer ADMIN_TOKEN, fall back to empty string so check fails rather than using a default.
+    return os.environ.get("ADMIN_TOKEN", "") or ""
+
+# call this if you update .env during runtime and want app to pick it up (optional)
+def reload_admin_token_from_env():
+    global ADMIN_TOKEN
+    ADMIN_TOKEN = _get_admin_token()
+    return ADMIN_TOKEN
+
+# initialize ADMIN_TOKEN global (safe: blank if not provided)
+ADMIN_TOKEN = _get_admin_token()
+
+def admin_required(f):
+    """
+    Decorator for admin-only endpoints.
+    Requires header X-Admin-Token: <token> which must exactly match ADMIN_TOKEN env var.
+    If ADMIN_TOKEN is empty/missing, admin endpoints are disabled (fail-safe).
+    """
+    @wraps(f)
+    def _wrap(*args, **kwargs):
+        # Fail safe: if no ADMIN_TOKEN configured, return 403 (don't allow anonymous fallback)
+        if not ADMIN_TOKEN:
+            return jsonify({"ok": False, "error": {"code": "admin_disabled", "message": "admin endpoints disabled (no ADMIN_TOKEN configured)"}}), 403
+
+        # Accept token either in X-Admin-Token header or admin_token query param (useful for CLI only)
+        token = (request.headers.get("X-Admin-Token") or request.args.get("admin_token") or "").strip()
+        if not token:
+            return jsonify({"ok": False, "error": {"code": "unauthorized", "message": "missing admin token"}}), 401
+
+        # compare constant-time
+        try:
+            import hmac
+            if not hmac.compare_digest(token, ADMIN_TOKEN):
+                return jsonify({"ok": False, "error": {"code": "unauthorized", "message": "invalid admin token"}}), 401
+        except Exception:
+            # fallback to plain compare (should not happen)
+            if token != ADMIN_TOKEN:
+                return jsonify({"ok": False, "error": {"code": "unauthorized", "message": "invalid admin token"}}), 401
+
+        # authorized
+        return f(*args, **kwargs)
     return _wrap
+
 
 
 @admin_bp.get("/wallet/fees")

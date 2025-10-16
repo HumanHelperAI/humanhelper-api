@@ -2,11 +2,11 @@
 set -euo pipefail
 
 # Usage:
-# BASE="http://127.0.0.1:5000" ADMIN_TOKEN="Muralidhar" PASS="Passw0rd!" ./tools/auto_smoke_end2end.sh
+# BASE="http://127.0.0.1:5000" ADMIN_TOKEN="<REDACTED_ADMIN_TOKEN>" PASS="REQUIRE_ENV_PASS" ./tools/auto_smoke_end2end.sh
 
 BASE="${BASE:-http://127.0.0.1:5000}"
-ADMIN_TOKEN="${ADMIN_TOKEN:-Muralidhar}"
-PASS="${PASS:-Passw0rd!}"
+ADMIN_TOKEN="${ADMIN_TOKEN:-}"
+PASS="${PASS:-REQUIRE_ENV_PASS}"
 
 # helper: http
 http() {

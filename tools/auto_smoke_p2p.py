@@ -3,7 +3,7 @@
 Auto smoke test: register two users, auto-read OTPs, verify, login, fund A, transfer A->B.
 
 Usage:
-  BASE="http://127.0.0.1:5000" ADMIN_TOKEN="Muralidhar" PASS="Passw0rd!" python3 tools/auto_smoke_p2p.py
+  BASE="http://127.0.0.1:5000" ADMIN_TOKEN="<REDACTED_ADMIN_TOKEN>" PASS="REQUIRE_ENV_PASS" python3 tools/auto_smoke_p2p.py
 """
 
 import os
@@ -15,7 +15,7 @@ import sys
 
 BASE = os.environ.get("BASE", "http://127.0.0.1:5000").rstrip("/")
 ADMIN_TOKEN = os.environ.get("ADMIN_TOKEN", "")
-PASS = os.environ.get("PASS", "Passw0rd!")
+PASS = os.environ.get("PASS", "REQUIRE_ENV_PASS")
 
 HEADERS = {"Content-Type": "application/json"}
 

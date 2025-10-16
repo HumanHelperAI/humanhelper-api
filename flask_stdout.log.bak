@@ -1,0 +1,11 @@
+nohup: ignoring input
+[hh] Starting HumanHelper backend on port 5000
+[hh] OPENROUTER configured: True
+[hh] OpenAI configured: True
+[hh] DEEPSEEK configured: True
+[hh] FREE_MODELS_PRIORITY: ['deepseek/deepseek-v3.1-free', 'deepseek/r1-free', 'nousresearch/deephermes-3-llama-3-8b-preview', 'openai/gpt-oss-20b-free', 'openai/gpt-oss-120b-free', 'google/gemini-2.0-flash-exp']
+🧹 Old logs cleanup done
+ * Serving Flask app 'app'
+ * Debug mode: on
+Address already in use
+Port 5000 is in use by another program. Either identify and stop that program, or start the server with a different port.

@@ -2,7 +2,7 @@
 set -eu
 BASE="${BASE:-https://api.humanhelperai.in}"
 MOBILE="${MOBILE:-9876543212}"
-PASS="${PASS:-Passw0rd!}"
+PASS="${PASS:-REQUIRE_ENV_PASS}"
 NAME="${NAME:-Smoke Tester}"
 EMAIL="${EMAIL:-smoke@test.com}"
 ADDR="${ADDR:-Hyderabad}"
