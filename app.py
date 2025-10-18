@@ -430,19 +430,20 @@ Talisman(app, **TALISMAN_CONFIG)
 
 
 
-
-# -------------------------------
-# Rate Limiter Configuration
-# -------------------------------
-
+# -----------------------------
+# Rate limiter configuration
+# -----------------------------
 import os
+from flask import g, jsonify
 from flask_limiter import Limiter
 from flask_limiter.util import get_remote_address
-from flask import g
+from flask_limiter.errors import RateLimitExceeded
 
 # Choose storage URI:
-# 1. Use Redis if available (Railway provides REDIS_URL)
-# 2. Fallback to memory:// for safety in single-instance mode
+# 1) Prefer explicit RATE_LIMIT_STORAGE_URI (if set)
+# 2) Then Railway-provided REDIS_URL (if set)
+# 3) Then older RATE_LIMIT_REDIS env (if set)
+# 4) Fallback to in-memory "memory://" for single-instance / safe dev behavior
 RATE_LIMIT_STORAGE_URI = (
     os.getenv("RATE_LIMIT_STORAGE_URI")
     or os.getenv("REDIS_URL")
@@ -450,37 +451,43 @@ RATE_LIMIT_STORAGE_URI = (
     or "memory://"
 )
 
-# Optional log to confirm which backend was chosen (remove later)
-print(f"[Limiter] Using rate-limit storage: {RATE_LIMIT_STORAGE_URI}")
+# Optional: log which storage is chosen (uses app.logger if available)
+try:
+    app.logger.info(f"[Limiter] Using rate-limit storage: {RATE_LIMIT_STORAGE_URI}")
+except Exception:
+    # logging not critical during import
+    print(f"[Limiter] Using rate-limit storage: {RATE_LIMIT_STORAGE_URI}")
 
-# Function to identify request key
+# Key function: prefer per-user (if authentication sets g.user_id), else per-IP
 def rate_key():
-    # If user_id exists in Flask global context (after auth), rate-limit per-user
-    if getattr(g, "user_id", None):
-        return f"user:{g.user_id}"
-    # Otherwise, fallback to per-IP
+    # If your auth code sets g.user_id, limit per-user
+    user_id = getattr(g, "user_id", None)
+    if user_id:
+        return f"user:{user_id}"
     return get_remote_address()
 
 # Initialize limiter safely
 limiter = Limiter(
     key_func=rate_key,
     storage_uri=RATE_LIMIT_STORAGE_URI,
-    default_limits=["1000/day", "200/hour"],
+    default_limits=["1000/day", "200/hour"],   # adjust to your desired defaults
     strategy="fixed-window",
     headers_enabled=True,
 )
 limiter.init_app(app)
 
-# Custom handler for limit exceeded
+# Custom handler for when rate limit exceeded
 @app.errorhandler(RateLimitExceeded)
 def ratelimit_handler(e):
-    return jsonify({
+    response = jsonify({
         "ok": False,
         "error": {
             "code": "rate_limited",
             "message": "Too many requests. Try later."
         }
-    }), 429
+    })
+    response.status_code = 429
+    return response
 
 
 
@@ -2112,7 +2119,12 @@ def login():
         return jsonify({"error": "invalid credentials"}), 400
 
     db = get_db()
-    row = db.execute("SELECT id,is_banned,is_verified,password_hash,name,email,address FROM users WHERE mobile=?", (mobile,)).fetchone()
+    sql = """
+SELECT id, is_banned, is_verified, password_hash, name, email, address
+FROM users
+WHERE mobile = %s
+"""
+row = db.execute(sql, (mobile,))
     db.close()
 
     if not row:
