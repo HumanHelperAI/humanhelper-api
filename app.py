@@ -425,17 +425,17 @@ TALISMAN_CONFIG = {
 }
 Talisman(app, **TALISMAN_CONFIG)
 
+# Use REDIS_URL if present, else fallback to in-memory (dev)
+
 from flask_limiter import Limiter
 from flask_limiter.util import get_remote_address
 import os
 
-RATE_LIMIT_STORAGE_URI = os.getenv("REDIS_URL") or os.getenv("RATE_LIMIT_REDIS") or "memory://"
+redis_url = os.getenv("REDIS_URL") or os.getenv("RATE_LIMIT_REDIS") or "memory://"
 limiter = Limiter(key_func=get_remote_address, storage_uri=redis_url, default_limits=["200 per day", "50 per hour"])
 limiter.init_app(app)
 
 
-# Use REDIS_URL if present, else fallback to in-memory (dev)
-RATE_LIMIT_STORAGE_URI = os.getenv("REDIS_URL") or os.getenv("RATE_LIMIT_REDIS_URI")
 
 def rate_key():
     """
