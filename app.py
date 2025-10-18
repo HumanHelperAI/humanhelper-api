@@ -2110,40 +2110,62 @@ def resend_code():
 
 
 @auth_bp.post("/login")
-@limiter.limit("5/minute;50/hour")
+@limiter.limit("20/hour")
 def login():
     d = request.get_json(silent=True) or {}
     mobile = _clean(d.get("mobile"))
     password = d.get("password") or ""
-    if not MOBILE_IN_RE.match(mobile) or not password:
-        return jsonify({"error": "invalid credentials"}), 400
+
+    if not MOBILE_IN_RE.match(mobile):
+        return jsonify({"error": "invalid mobile"}), 400
+    if len(password) < 8:
+        return jsonify({"error": "password too short"}), 400
 
     db = get_db()
-    row = db.execute("SELECT id,is_banned,is_verified,password_hash,name,email,address FROM users WHERE mobile=%s", (mobile,))
-    row = db.execute(sql, (mobile,))
-    db.close()
+    try:
+        # ✅ Define SQL before using it
+        sql = "SELECT id, name, password_hash, is_verified FROM users WHERE mobile=%s"
+        row = execq(db, sql, (mobile,)).fetchone()
 
-    if not row:
-        return jsonify({"error": "user not found"}), 404
-    if row["is_banned"]:
-        return jsonify({"error": "account banned"}), 403
-    if not row["is_verified"]:
-        return jsonify({"error": "not verified"}), 403
-    if not pbkdf2_sha256.verify(password, row["password_hash"]):
-        return jsonify({"error": "invalid credentials"}), 401
+        if not row:
+            db.close()
+            return jsonify({"error": "user not found"}), 404
 
-    access = make_access_token(row["id"], mobile)
-    refresh = make_refresh_token(row["id"])
+        # handle both sqlite and Postgres row formats
+        try:
+            user_id = row["id"]
+            name = row["name"]
+            pwd_hash = row["password_hash"]
+            verified = int(row["is_verified"])
+        except Exception:
+            user_id = row.get("id")
+            name = row.get("name")
+            pwd_hash = row.get("password_hash")
+            verified = int(row.get("is_verified", 0))
 
-    return jsonify({
-        "ok": True,
-        "user": {
-            "id": row["id"], "name": row["name"], "mobile": mobile,
-            "email": row["email"], "address": row["address"]
-        },
-        "access": access,
-        "refresh": refresh
-    }), 200
+        if not pbkdf2_sha256.verify(password, pwd_hash):
+            db.close()
+            return jsonify({"error": "invalid password"}), 401
+        if verified == 0:
+            db.close()
+            return jsonify({"error": "account not verified"}), 403
+
+        token = _gen_token(user_id)
+        db.close()
+        return jsonify({"ok": True, "token": token, "user": {"id": user_id, "name": name}}), 200
+
+    except Exception as e:
+        app.logger.exception("login: db error")
+        try:
+            db.rollback()
+        except Exception:
+            pass
+        try:
+            db.close()
+        except Exception:
+            pass
+        return jsonify({"ok": False, "error": {"code": "internal_error", "message": str(e)}}), 500
+
 
 
 @auth_bp.post("/refresh")
