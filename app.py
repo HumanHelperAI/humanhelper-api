@@ -429,7 +429,7 @@ from flask_limiter import Limiter
 from flask_limiter.util import get_remote_address
 import os
 
-redis_url = os.getenv("RATE_LIMIT_REDIS", "redis://127.0.0.1:6379/0")
+RATE_LIMIT_STORAGE_URI = os.getenv("REDIS_URL") or os.getenv("RATE_LIMIT_REDIS") or "memory://"
 limiter = Limiter(key_func=get_remote_address, storage_uri=redis_url, default_limits=["200 per day", "50 per hour"])
 limiter.init_app(app)
 
