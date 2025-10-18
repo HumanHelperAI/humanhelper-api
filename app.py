@@ -425,35 +425,53 @@ TALISMAN_CONFIG = {
 }
 Talisman(app, **TALISMAN_CONFIG)
 
-# Use REDIS_URL if present, else fallback to in-memory (dev)
 
+
+
+
+
+
+# -------------------------------
+# Rate Limiter Configuration
+# -------------------------------
+
+import os
 from flask_limiter import Limiter
 from flask_limiter.util import get_remote_address
-import os
+from flask import g
 
-redis_url = os.getenv("REDIS_URL") or os.getenv("RATE_LIMIT_REDIS") or "memory://"
-limiter = Limiter(key_func=get_remote_address, storage_uri=redis_url, default_limits=["200 per day", "50 per hour"])
-limiter.init_app(app)
-
-
-
-def rate_key():
-    """
-    Per-user limits when authenticated, otherwise per-IP.
-    """
-    if getattr(g, "user_id", None):
-        return f"user:{g.user_id}"
-    return get_remote_address()
-
-limiter = Limiter(
-    key_func=rate_key,
-    app=app,
-    default_limits=["1000/day", "200/hour"],
-    storage_uri=RATE_LIMIT_STORAGE_URI,   # e.g. redis://default:<password>@<host>:<port>/0
-    strategy="fixed-window",
-    headers_enabled=True
+# Choose storage URI:
+# 1. Use Redis if available (Railway provides REDIS_URL)
+# 2. Fallback to memory:// for safety in single-instance mode
+RATE_LIMIT_STORAGE_URI = (
+    os.getenv("RATE_LIMIT_STORAGE_URI")
+    or os.getenv("REDIS_URL")
+    or os.getenv("RATE_LIMIT_REDIS")
+    or "memory://"
 )
 
+# Optional log to confirm which backend was chosen (remove later)
+print(f"[Limiter] Using rate-limit storage: {RATE_LIMIT_STORAGE_URI}")
+
+# Function to identify request key
+def rate_key():
+    # If user_id exists in Flask global context (after auth), rate-limit per-user
+    if getattr(g, "user_id", None):
+        return f"user:{g.user_id}"
+    # Otherwise, fallback to per-IP
+    return get_remote_address()
+
+# Initialize limiter safely
+limiter = Limiter(
+    key_func=rate_key,
+    storage_uri=RATE_LIMIT_STORAGE_URI,
+    default_limits=["1000/day", "200/hour"],
+    strategy="fixed-window",
+    headers_enabled=True,
+)
+limiter.init_app(app)
+
+# Custom handler for limit exceeded
 @app.errorhandler(RateLimitExceeded)
 def ratelimit_handler(e):
     return jsonify({
@@ -463,8 +481,6 @@ def ratelimit_handler(e):
             "message": "Too many requests. Try later."
         }
     }), 429
-
-
 
 
 
