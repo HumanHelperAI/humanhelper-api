@@ -2119,12 +2119,8 @@ def login():
         return jsonify({"error": "invalid credentials"}), 400
 
     db = get_db()
-    sql = """
-SELECT id, is_banned, is_verified, password_hash, name, email, address
-FROM users
-WHERE mobile = %s
-"""
-row = db.execute(sql, (mobile,))
+    row = db.execute("SELECT id,is_banned,is_verified,password_hash,name,email,address FROM users WHERE mobile=%s", (mobile,))
+    row = db.execute(sql, (mobile,))
     db.close()
 
     if not row:
